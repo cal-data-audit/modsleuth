@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- env / secrets ---
+.env
+.claude/
+
+# --- generated artifacts ---
+storage/
+run-logs/
+*.db
+*.db-shm
+*.db-wal
+*.zip
+
+# --- editor / OS ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

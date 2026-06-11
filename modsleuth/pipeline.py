@@ -162,37 +162,54 @@ def install_signal_handlers() -> None:
         pass
 
 
-def _tail_usage(stream_path: Path, offset: int, carry: bytes) -> tuple[int, bytes, int]:
+def _tail_usage(stream_path: Path, offset: int, carry: bytes,
+                think_est: int) -> tuple[int, bytes, int, int]:
     """Incrementally accumulate output tokens from a growing stream:
     read bytes appended since `offset`, parse complete JSONL lines, and
-    return (new_offset, carried_partial_line, output_token_delta).
-    Cheap enough to run every poll — it never re-reads old bytes."""
+    return (new_offset, carried_partial_line, completed_output_delta,
+    current_turn_thinking_estimate).
+
+    Completed assistant turns report authoritative usage; in between,
+    `system/thinking_tokens` events estimate the in-flight turn (long
+    thinking stretches would otherwise read as zero). A turn's thinking
+    is billed inside its completed usage, so the estimate resets to 0
+    whenever a usage event lands. Cheap enough to run every poll — it
+    never re-reads old bytes."""
     try:
         with stream_path.open("rb") as f:
             f.seek(offset)
             data = f.read()
     except OSError:
-        return offset, carry, 0
+        return offset, carry, 0, think_est
     if not data:
-        return offset, carry, 0
+        return offset, carry, 0, think_est
     new_offset = offset + len(data)
     buf = carry + data
     lines = buf.split(b"\n")
     carry = lines.pop()  # last element is a partial line (or b"")
     delta = 0
     for line in lines:
-        if b'"usage"' not in line:
+        if b'"usage"' not in line and b"thinking_tokens" not in line:
             continue
         try:
             rec = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        if rec.get("type") != "assistant":
-            continue
-        value = ((rec.get("message") or {}).get("usage") or {}).get("output_tokens")
-        if isinstance(value, (int, float)):
-            delta += int(value)
-    return new_offset, carry, delta
+        kind = rec.get("type")
+        if kind == "assistant":
+            value = ((rec.get("message") or {}).get("usage") or {}).get("output_tokens")
+            if isinstance(value, (int, float)):
+                delta += int(value)
+                think_est = 0
+        elif kind == "system" and rec.get("subtype") == "thinking_tokens":
+            d = rec.get("estimated_tokens_delta")
+            if isinstance(d, (int, float)):
+                think_est += int(d)
+            else:
+                total = rec.get("estimated_tokens")
+                if isinstance(total, (int, float)):
+                    think_est = max(think_est, int(total))
+    return new_offset, carry, delta, think_est
 
 
 def parse_stream_json(stream_path: Path) -> dict:
@@ -282,6 +299,7 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
             tail_offset = 0
             tail_carry = b""
             live_out_tokens = 0
+            live_think_est = 0
             while True:
                 try:
                     rc = proc.wait(timeout=POLL_INTERVAL_S)
@@ -292,8 +310,8 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
                     cur_size = stream_path.stat().st_size
                 except OSError:
                     cur_size = last_size
-                tail_offset, tail_carry, delta = _tail_usage(
-                    stream_path, tail_offset, tail_carry)
+                tail_offset, tail_carry, delta, live_think_est = _tail_usage(
+                    stream_path, tail_offset, tail_carry, live_think_est)
                 live_out_tokens += delta
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_EVERY_S:
                     last_heartbeat = time.monotonic()
@@ -301,7 +319,7 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
                         f"{label or run_id}: running · "
                         f"{(time.monotonic() - started) / 60:.1f}m elapsed · "
                         f"stream {cur_size / 1024:.0f}KB · "
-                        f"{live_out_tokens / 1000:.1f}K tokens out"
+                        f"~{(live_out_tokens + live_think_est) / 1000:.1f}K tokens out"
                     )
                 if cur_size != last_size:
                     last_size = cur_size
@@ -2746,22 +2764,31 @@ def run_merge(
         # per-batch relate artifacts when reconcile hasn't run.
         sources = [str(_latest_lattice_artifact_path())]
         if relations_sources is None:
+            rows = all_rows(
+                "SELECT artifact_path FROM batch_artifacts "
+                "WHERE stage='relate' AND status='complete'"
+            )
+            relate_paths = [
+                Path(row["artifact_path"]) for row in rows
+                if row["artifact_path"] and Path(row["artifact_path"]).exists()
+            ]
             recon = sorted(
                 (config.STORAGE / config.RUNS_SUBDIR).glob(
                     f"*/{config.RECONCILE_ARTIFACT_FILE}"),
                 key=lambda p: p.stat().st_mtime, reverse=True,
             )
-            if recon:
+            newest_relate = max((p.stat().st_mtime for p in relate_paths),
+                                default=0.0)
+            if recon and recon[0].stat().st_mtime >= newest_relate:
+                # The reconciled view is current — its subsumption marks
+                # and conflicts must survive into the final graph.
                 relations_sources = [str(recon[0])]
             else:
-                rows = all_rows(
-                    "SELECT artifact_path FROM batch_artifacts "
-                    "WHERE stage='relate' AND status='complete'"
-                )
-                relations_sources = [
-                    row["artifact_path"] for row in rows
-                    if row["artifact_path"] and Path(row["artifact_path"]).exists()
-                ]
+                # No reconcile artifact, or relate batches landed after
+                # the last reconcile (e.g., its rerun failed mid-
+                # expansion): fall back to the raw batches rather than
+                # silently merging a stale reconciled view.
+                relations_sources = [str(p) for p in relate_paths]
     lattice_artifacts = [read_json(s) for s in sources]
     merged_lattice, lattice_conflicts = _merge_lattices(lattice_artifacts)
 

@@ -69,6 +69,10 @@ SKIP_DIRS = {"__pycache__", "node_modules", "venv", ".venv", ".git"}
 SQLITE_BUSY_TIMEOUT_S = 30.0
 PROCESS_KILL_GRACE_S = 5.0
 MAX_PARALLEL_BATCHES = int(os.environ.get("MODSLEUTH_MAX_PARALLEL_BATCHES", "32"))
+# Watchdog: kill a planner whose output stream stays silent this long.
+# Planners quietly waiting on long subagents are silent too, so this
+# must stay far above legitimate subagent runtimes.
+STREAM_SILENCE_LIMIT_S = float(os.environ.get("MODSLEUTH_STREAM_SILENCE_S", "1800"))
 HASH_CHUNK_BYTES = 1 << 20   # streaming chunk size for sha256_file
 
 # Models. Names are free-form: any alias (`opus`, `sonnet`, `haiku`)
@@ -84,7 +88,9 @@ SUBAGENT_PROMPT_CLAUDE = (
     "## Subagent dispatch (Task tool)\n"
     "\n"
     "The Task tool is available. Pass `model: \"{model}\"` on every "
-    "Task call so each subagent runs as `{model}`. "
+    "Task call so each subagent runs as `{model}` — use that exact "
+    "string, never a shortened alias like `sonnet` (aliases resolve "
+    "to a different context tier). "
     "Use them when the work has parallel structure: a directory "
     "of sources, a list of family buckets, anything where one "
     "unit can be analyzed without reading the others. Each Task "

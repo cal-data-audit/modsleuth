@@ -87,6 +87,12 @@ Storage defaults to `./storage` under the directory you run from;
 override with `MODSLEUTH_STORAGE` (state and artifacts) and
 `MODSLEUTH_PATH` (SQLite database).
 
+A stalled planner (no output-stream activity at all) is killed and
+retried after `MODSLEUTH_STREAM_SILENCE_S` seconds (default 1800).
+Planners that fan out to subagents are legitimately silent while they
+wait, so keep this generous — lower it only for single-shot stages you
+know stream continuously.
+
 ## The base pipeline
 
 The base pipeline runs eight stages over the artifacts of a single
@@ -111,7 +117,14 @@ are markdown files in `modsleuth/prompts/`.
 
 `modsleuth status` prints a per-stage progress snapshot: when each
 stage last completed, batch progress with mention / edge totals,
-conflict and provenance-flag counts, and the suggested next command.
+conflict and provenance-flag counts, a one-line token-usage total,
+and the suggested next command.
+
+`modsleuth usage` breaks token usage and reported cost down per stage
+(`--runs` for per-run lines, stalled runs flagged). Numbers come from
+each planner's own stream accounting, subagent turns included;
+aborted runs report what they consumed before stopping. Usage is
+per-storage — in a recursive run, check each seed's storage.
 
 Long-running stages also stream progress to stderr while they work —
 planner start / heartbeat / done lines, per-batch completions, and
@@ -195,7 +208,16 @@ To merge across seeds into a single graph, pass each per-seed
 > **Aborting a run.** Send `SIGINT` (Ctrl-C) to the top-level
 > `modsleuth` Python process to abort cleanly. Killing only the inner
 > `claude` subprocess will trigger the pipeline's automatic retry —
-> the parent stays alive and respawns the subprocess.
+> the parent stays alive and respawns the subprocess. Stage processes
+> reap their planners on SIGINT/SIGTERM and at exit, but planners run
+> in their own sessions — after any abort, `pgrep -fl "claude -p"`
+> should come back empty; kill stragglers to stop them billing.
+>
+> **Resuming.** Re-running `modsleuth recursive` against the same
+> `--storage-root` reuses each seed's completed base pipeline (it
+> skips straight to expansion rounds when a merged graph exists);
+> `run extract` / `run relate` always skip completed batches. Point
+> `--storage-root` at a fresh directory for a clean run.
 
 ## Post-merge cleanup (`modsleuth dedup`)
 
@@ -382,3 +404,17 @@ demo (https://modsleuth.cal-data-audit.org).
 - **dependency-kind** — coarse type label (`direct` / `indirect`) on every
   edge, distinguishing artifacts that materially enter weights or training
   data from those that merely influence development decisions.
+- **evidence provenance** — every source batch is stamped with the
+  tracing target it was gathered for; edges inherit the stamp and
+  accumulate `traced_targets` as runs corroborate them. A batch whose
+  exact source content already exists keeps its *first* target
+  (first-writer-wins at the batch level; union-at-the-edge level), and
+  an edge whose subject's org never appears among its evidence targets
+  is flagged `provenance_review: true` — routed to review, never
+  dropped.
+- **edge quarantine** — relate validation is strict per edge, not per
+  batch: structurally invalid edges (no anchors, unresolved subject,
+  self-loop, …) move to the artifact's `rejected_edges[]` with reasons
+  while the valid remainder proceeds; string anchor entries are
+  mechanically coerced to `{source: …}` objects first. A batch fails
+  only when nothing valid survives.

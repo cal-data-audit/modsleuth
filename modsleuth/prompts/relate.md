@@ -619,6 +619,10 @@ When dispatching, transcribe verbatim into each subagent's brief:
 - The "Append-as-you-go" instruction (file path + how to append).
 - The "Subject is always a Model" rule (load-bearing — subagents
   default to dataset-subject framing without this).
+- The anchor schema: EVERY `anchor_list` entry — event-level AND
+  edge-level — is an object `{source, explanation, position?,
+  excerpt?}`, never a bare string. Structurally invalid edges are
+  quarantined out of the graph at validation.
 - The "Aggregator + leaf rule" section (subject emits one edge
   per leaf in the aggregator's subsets[]).
 - The "Lattice anchoring — preserve source specificity" section.

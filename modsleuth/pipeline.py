@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -132,6 +133,35 @@ def terminate_pgrp(pid: int) -> None:
         pass
 
 
+# Live `claude` planner pids. Planners run in their own sessions (so the
+# watchdog can group-kill them without touching us), which means they do
+# NOT die with this process — every abort path must reap them explicitly
+# or they keep running (and billing) as orphans.
+_LIVE_SPAWN_PIDS: set[int] = set()
+
+
+def _reap_live_spawns() -> None:
+    for pid in list(_LIVE_SPAWN_PIDS):
+        _LIVE_SPAWN_PIDS.discard(pid)
+        terminate_pgrp(pid)
+
+
+atexit.register(_reap_live_spawns)
+
+
+def install_signal_handlers() -> None:
+    """Convert SIGTERM into SystemExit so `finally` blocks and atexit
+    run — a bare `kill`/`pkill` otherwise skips Python cleanup and
+    orphans any live planner. Called once from the CLI entry point;
+    no-op outside the main thread."""
+    def _on_term(signum, _frame):
+        raise SystemExit(128 + signum)
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except ValueError:
+        pass
+
+
 def parse_stream_json(stream_path: Path) -> dict:
     out: dict[str, Any] = {
         "turns": 0, "cost_usd": 0.0,
@@ -152,7 +182,18 @@ def parse_stream_json(stream_path: Path) -> dict:
         kind = rec.get("type")
         if kind == "assistant":
             out["turns"] += 1
-            for content in (rec.get("message") or {}).get("content") or []:
+            message = rec.get("message") or {}
+            # Accumulate per-call usage as we go: aborted / watchdog-
+            # killed runs never reach the terminal `result` event, and
+            # their spend must still be visible. When a result event IS
+            # present, its authoritative totals overwrite these sums.
+            usage = message.get("usage") or {}
+            for key in ("input_tokens", "output_tokens",
+                        "cache_creation_input_tokens", "cache_read_input_tokens"):
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    out[key] += int(value)
+            for content in message.get("content") or []:
                 if not isinstance(content, dict):
                     continue
                 if content.get("type") == "tool_use":
@@ -192,7 +233,7 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
     ]
     started = time.monotonic()
     killed_for_stall = False
-    STREAM_SILENCE_LIMIT_S = 300.0
+    silence_limit = config.STREAM_SILENCE_LIMIT_S
     POLL_INTERVAL_S = 30.0
     HEARTBEAT_EVERY_S = 120.0
     with stream_path.open("w") as stdout, err_path.open("w") as stderr:
@@ -200,6 +241,7 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
             cmd, cwd=config.ROOT, env=runtime_env(run_id),
             stdout=stdout, stderr=stderr, text=True, start_new_session=True,
         )
+        _LIVE_SPAWN_PIDS.add(proc.pid)
         try:
             last_size = 0
             last_activity = time.monotonic()
@@ -224,7 +266,11 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
                 if cur_size != last_size:
                     last_size = cur_size
                     last_activity = time.monotonic()
-                elif time.monotonic() - last_activity > STREAM_SILENCE_LIMIT_S:
+                elif time.monotonic() - last_activity > silence_limit:
+                    # A planner that is quietly waiting on a long
+                    # subagent is silent too — the limit must stay far
+                    # above legitimate wait times (tune with
+                    # MODSLEUTH_STREAM_SILENCE_S).
                     terminate_pgrp(proc.pid)
                     try:
                         rc = proc.wait(timeout=10)
@@ -235,14 +281,19 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
                         with err_path.open("a") as ef:
                             ef.write(
                                 "\n[watchdog] killed subprocess after "
-                                f"{int(STREAM_SILENCE_LIMIT_S)}s of stream silence\n"
+                                f"{int(silence_limit)}s of stream silence\n"
                             )
                     except OSError:
                         pass
                     break
-        except (KeyboardInterrupt, SystemExit):
+        except BaseException:
+            # Any abort path (Ctrl-C, SIGTERM-as-SystemExit, internal
+            # error) must reap the planner — it lives in its own
+            # session and never dies with us.
             terminate_pgrp(proc.pid)
             raise
+        finally:
+            _LIVE_SPAWN_PIDS.discard(proc.pid)
     elapsed = time.monotonic() - started
     stats = parse_stream_json(stream_path)
     tool_calls = stats.pop("tool_calls", [])
@@ -563,6 +614,9 @@ def run_extract(
         spawn = dispatch_spawn(run_id, prompt, model=planner_model,
                                label=f"extract {bid[:8]}")
         if spawn["exit_code"] != 0 or not artifact_out.exists():
+            _mark_batch_failed(bid, "extract", run_id,
+                               f"planner exit {spawn['exit_code']}"
+                               if spawn["exit_code"] != 0 else "no artifact written")
             return {"batch_id": bid, "status": "failed", "log_dir": spawn["log_dir"]}
         artifact = read_json(artifact_out)
         artifact["_artifact_path"] = str(artifact_out)
@@ -1189,46 +1243,76 @@ def _is_snake_case_label(value: object) -> bool:
     return True
 
 
-def _validate_anchor_list(anchors: object, where: str) -> None:
-    """Validate `anchor_list` shape: non-empty list of dicts with required
-    `source: str` and `explanation: str`; optional `position: str`."""
+def _coerce_anchor_list(anchors: object) -> tuple[list, int]:
+    """Mechanically coerce string anchor entries into dicts —
+    `'olmo3-paper.pdf'` becomes `{source: 'olmo3-paper.pdf',
+    explanation: '(unstructured anchor)'}`. Pure shape routing, no
+    judgment. Returns (coerced_list, coercion_count)."""
+    if not isinstance(anchors, list):
+        return [], 0
+    out: list = []
+    coerced = 0
+    for anc in anchors:
+        if isinstance(anc, str) and anc.strip():
+            out.append({"source": anc.strip(),
+                        "explanation": "(unstructured anchor)"})
+            coerced += 1
+        else:
+            out.append(anc)
+    return out, coerced
+
+
+def _anchor_list_error(anchors: object) -> str | None:
+    """Return the first schema problem in an anchor_list, or None if it
+    is a non-empty list of dicts with `source` + `explanation` strings
+    (optional `position` string)."""
     if not isinstance(anchors, list) or not anchors:
-        raise click.ClickException(f"{where}.anchor_list must be a non-empty list")
+        return "anchor_list must be a non-empty list"
     for j, anc in enumerate(anchors):
         if not isinstance(anc, dict):
-            raise click.ClickException(f"{where}.anchor_list[{j}] is not a dict")
+            return f"anchor_list[{j}] is not a dict"
         src = anc.get("source")
         if not isinstance(src, str) or not src.strip():
-            raise click.ClickException(
-                f"{where}.anchor_list[{j}].source must be a non-empty string"
-            )
+            return f"anchor_list[{j}].source must be a non-empty string"
         expl = anc.get("explanation")
         if not isinstance(expl, str) or not expl.strip():
-            raise click.ClickException(
-                f"{where}.anchor_list[{j}].explanation must be a non-empty string"
-            )
+            return f"anchor_list[{j}].explanation must be a non-empty string"
         pos = anc.get("position")
         if pos is not None and not isinstance(pos, str):
-            raise click.ClickException(
-                f"{where}.anchor_list[{j}].position must be a string when present"
-            )
+            return f"anchor_list[{j}].position must be a string when present"
+    return None
 
 
 def _validate_relate_artifact(artifact: dict, *,
                               lattice_formal_names: set[str] | None = None,
                               lattice_family_names: set[str] | None = None,
                               ) -> dict:
-    """Sanity-check the assembled relate artifact's shape. Returns:
+    """Validate the assembled relate artifact with per-edge QUARANTINE
+    semantics. Structurally invalid edges are moved to the artifact's
+    top-level `rejected_edges[]` with reasons instead of failing the
+    batch — rejection is per edge (the paper's rule), and deterministic
+    code routes rather than destroys. String anchor entries are
+    mechanically coerced to dicts first; event-wrapper problems never
+    cost edges (the wrapper is context — the per-edge anchors are the
+    load-bearing evidence). The artifact is mutated in place.
+
+    Raises only when nothing is salvageable: wrong artifact shape, or
+    zero valid edges remain.
+
+    Returns:
 
     {
-      "operation_count":       int,
-      "edge_count":            int,
-      "singleton_event_count": int,   # events with exactly 1 edge
+      "operation_count":         int,   # operations with ≥1 valid edge
+      "edge_count":              int,   # valid edges kept
+      "singleton_event_count":   int,
       "off_lattice_object_count": int,
-      "direct_count":          int,
-      "indirect_count":        int,
-      "kind_correction_count": int,   # canonical-relation kinds corrected in place
-      "coined_relations":      {label: count},
+      "direct_count":            int,
+      "indirect_count":          int,
+      "kind_correction_count":   int,   # known-relation kinds corrected in place
+      "coerced_anchor_count":    int,   # string anchors mechanically dict-ified
+      "rejected_edge_count":     int,
+      "dropped_operation_count": int,   # operations left with no valid edge
+      "coined_relations":        {label: count},
     }
 
     Schema (post-fix):
@@ -1251,16 +1335,21 @@ def _validate_relate_artifact(artifact: dict, *,
             }
           ]
         }
+      ],
+      "rejected_edges": [
+        {"op_index": 0, "edge_index": 2, "subject": "...",
+         "relation": "...", "object": "...", "reason": "..."}
       ]
     }
 
-    Closed-vocab enforced:
-      - `dependency_kind` ∈ {direct, indirect}.
-      - `subject` must be a lattice formal_name when lattice is provided.
+    Enforced per edge (violations quarantine the edge): subject resolves
+    to the lattice (formal_name or virtual concept address) when a
+    lattice is provided; snake_case relation; dependency_kind ∈
+    {direct, indirect} after deterministic relation→kind coercion;
+    non-empty object / description; no self-loops; dict-shaped
+    anchor_list carrying source + explanation.
 
-    Open-vocab tracked:
-      - `relation`: snake_case; values outside `CANONICAL_RELATION_VALUES`
-        are counted as coined but not rejected.
+    Open-vocab tracked: coined relations counted, never rejected.
     """
     if not isinstance(artifact, dict):
         raise click.ClickException("relate artifact is not a dict")
@@ -1270,105 +1359,127 @@ def _validate_relate_artifact(artifact: dict, *,
 
     canonical_relations = set(CANONICAL_RELATION_VALUES)
 
-    edge_total = 0
     singleton_events = 0
     off_lattice = 0
     direct_count = 0
     indirect_count = 0
     kind_corrections = 0
+    coerced_anchors = 0
+    dropped_ops = 0
     coined_relations: dict[str, int] = {}
+    rejected: list[dict] = []
+    kept_ops: list[dict] = []
+
+    def _edge_check(edge: dict) -> tuple[str | None, int, int]:
+        """Mutates the edge (anchor coercion, kind correction); returns
+        (rejection_reason_or_None, kind_corrections, anchor_coercions)."""
+        corrected = 0
+        anchors, coerced = _coerce_anchor_list(edge.get("anchor_list"))
+        edge["anchor_list"] = anchors
+        subject = edge.get("subject")
+        if not isinstance(subject, str) or not subject.strip():
+            return "subject is missing", corrected, coerced
+        if lattice_formal_names is not None and subject not in lattice_formal_names:
+            # Subject may also be a virtual concept address
+            # `<family> [<k>=<v>, ...]` whose family pivots to the lattice.
+            virt = parse_virtual_address(subject)
+            if virt is None:
+                return (f"subject {subject!r} resolves to neither a lattice "
+                        "formal_name nor a virtual concept address"), corrected, coerced
+            fam_name, _facets = virt
+            if (lattice_family_names is not None
+                    and fam_name not in lattice_family_names):
+                return (f"subject virtual address pivots to unknown family "
+                        f"{fam_name!r}"), corrected, coerced
+        relation = edge.get("relation")
+        if not _is_snake_case_label(relation):
+            return (f"relation {relation!r} is not a valid label "
+                    "(non-empty snake_case ≤64 chars)"), corrected, coerced
+        dep_kind = edge.get("dependency_kind")
+        expected_kind = RELATION_DEPENDENCY_KIND.get(relation)
+        if expected_kind is not None and dep_kind != expected_kind:
+            # Known relations carry a fixed dependency_kind; the mapping
+            # is deterministic, so correct the label in place rather
+            # than trust the planner's value.
+            edge["dependency_kind"] = expected_kind
+            dep_kind = expected_kind
+            corrected = 1
+        if dep_kind not in DEPENDENCY_KIND_VALUES:
+            return (f"dependency_kind {dep_kind!r} not in "
+                    f"{DEPENDENCY_KIND_VALUES}"), corrected, coerced
+        obj = edge.get("object")
+        if not isinstance(obj, str) or not obj.strip():
+            return "object must be a non-empty string", corrected, coerced
+        if obj.strip() == subject.strip():
+            # An artifact cannot depend on itself; every self-loop in
+            # the QA'd release run was an extraction error.
+            return (f"self-loop — subject and object are both "
+                    f"{subject!r}"), corrected, coerced
+        edge_desc = edge.get("description")
+        if not isinstance(edge_desc, str) or not edge_desc.strip():
+            return "description is missing or empty", corrected, coerced
+        anc_err = _anchor_list_error(anchors)
+        if anc_err:
+            return anc_err, corrected, coerced
+        return None, corrected, coerced
 
     for i, op in enumerate(operations):
         if not isinstance(op, dict):
-            raise click.ClickException(f"operations[{i}] is not a dict")
+            dropped_ops += 1
+            rejected.append({"op_index": i,
+                             "reason": "operation is not a dict"})
+            continue
         desc = op.get("description")
         if not isinstance(desc, str) or not desc.strip():
-            raise click.ClickException(
-                f"operations[{i}].description is missing or empty"
-            )
-        _validate_anchor_list(op.get("anchor_list"), f"operations[{i}]")
-
+            # Event wrappers are context, not evidence — default rather
+            # than lose the edges inside.
+            op["description"] = "(undescribed event)"
+        op_anchors, n = _coerce_anchor_list(op.get("anchor_list"))
+        coerced_anchors += n
+        # Event-level anchors are contextual; keep only well-formed
+        # entries and never reject edges over the wrapper.
+        op["anchor_list"] = [
+            a for a in op_anchors
+            if isinstance(a, dict)
+            and isinstance(a.get("source"), str) and a["source"].strip()
+        ]
         edges = op.get("edges")
         if not isinstance(edges, list) or not edges:
-            raise click.ClickException(
-                f"operations[{i}].edges must be a non-empty list"
-            )
-        if len(edges) == 1:
-            singleton_events += 1
-        edge_total += len(edges)
-
+            dropped_ops += 1
+            rejected.append({"op_index": i,
+                             "description": op.get("description"),
+                             "reason": "operation has no edges[]"})
+            continue
+        kept_edges: list[dict] = []
         for j, edge in enumerate(edges):
-            where = f"operations[{i}].edges[{j}]"
             if not isinstance(edge, dict):
-                raise click.ClickException(f"{where} is not a dict")
-
-            subject = edge.get("subject")
-            if not isinstance(subject, str) or not subject.strip():
-                raise click.ClickException(f"{where}.subject is missing")
-            if lattice_formal_names is not None and subject not in lattice_formal_names:
-                # Subject may also be a virtual concept address
-                # `<family> [<k>=<v>, ...]`. Accept it if the family
-                # name pivots to a known lattice family.
-                virt = parse_virtual_address(subject)
-                if virt is None:
-                    raise click.ClickException(
-                        f"{where}.subject {subject!r} is not a lattice "
-                        "formal_name and not a virtual concept address "
-                        "(format: '<family> [<facet>=<value>, ...]')"
-                    )
-                fam_name, _facets = virt
-                if (lattice_family_names is not None
-                        and fam_name not in lattice_family_names):
-                    raise click.ClickException(
-                        f"{where}.subject virtual address pivots to unknown "
-                        f"family {fam_name!r}; not in lattice"
-                    )
-
-            relation = edge.get("relation")
-            if not _is_snake_case_label(relation):
-                raise click.ClickException(
-                    f"{where}.relation {relation!r} is not a valid label "
-                    f"(non-empty snake_case string ≤64 chars)"
-                )
+                rejected.append({"op_index": i, "edge_index": j,
+                                 "reason": "edge is not a dict"})
+                continue
+            reason, corrected, coerced = _edge_check(edge)
+            kind_corrections += corrected
+            coerced_anchors += coerced
+            if reason:
+                rejected.append({
+                    "op_index": i, "edge_index": j,
+                    "subject": edge.get("subject"),
+                    "relation": edge.get("relation"),
+                    "object": edge.get("object"),
+                    "reason": reason,
+                })
+                continue
+            kept_edges.append(edge)
+            relation = edge["relation"]
             if relation not in canonical_relations:
                 coined_relations[relation] = coined_relations.get(relation, 0) + 1
-
-            dep_kind = edge.get("dependency_kind")
-            expected_kind = RELATION_DEPENDENCY_KIND.get(relation)
-            if expected_kind is not None and dep_kind != expected_kind:
-                # Canonical relations carry a fixed dependency_kind; the
-                # mapping is deterministic, so correct the label in place
-                # rather than trust the planner's value.
-                edge["dependency_kind"] = expected_kind
-                dep_kind = expected_kind
-                kind_corrections += 1
-            if dep_kind not in DEPENDENCY_KIND_VALUES:
-                raise click.ClickException(
-                    f"{where}.dependency_kind {dep_kind!r} not in "
-                    f"{DEPENDENCY_KIND_VALUES}"
-                )
-            if dep_kind == "direct":
+            if edge["dependency_kind"] == "direct":
                 direct_count += 1
             else:
                 indirect_count += 1
-
-            obj = edge.get("object")
-            if not isinstance(obj, str) or not obj.strip():
-                raise click.ClickException(
-                    f"{where}.object must be a non-empty string"
-                )
-            if obj.strip() == subject.strip():
-                # An artifact cannot depend on itself; every self-loop in
-                # the QA'd release run was an extraction error.
-                raise click.ClickException(
-                    f"{where}: subject and object are both {subject!r} "
-                    "(self-loop)"
-                )
+            obj = edge["object"]
             if lattice_formal_names is not None and obj not in lattice_formal_names:
-                # Object may also be a virtual concept address — that's
-                # still on-lattice (its family pivot resolves). Only
-                # count as off-lattice if neither formal_name nor
-                # virtual address resolves to a known family.
+                # A virtual concept address is still on-lattice when its
+                # family pivot resolves.
                 virt = parse_virtual_address(obj)
                 fam_resolves = (
                     virt is not None
@@ -1377,23 +1488,37 @@ def _validate_relate_artifact(artifact: dict, *,
                 )
                 if not fam_resolves:
                     off_lattice += 1
+        if not kept_edges:
+            dropped_ops += 1
+            continue
+        op["edges"] = kept_edges
+        if len(kept_edges) == 1:
+            singleton_events += 1
+        kept_ops.append(op)
 
-            edge_desc = edge.get("description")
-            if not isinstance(edge_desc, str) or not edge_desc.strip():
-                raise click.ClickException(
-                    f"{where}.description is missing or empty"
-                )
+    artifact["operations"] = kept_ops
+    if rejected:
+        artifact["rejected_edges"] = rejected
+    else:
+        artifact.pop("rejected_edges", None)
 
-            _validate_anchor_list(edge.get("anchor_list"), where)
-
+    edge_total = sum(len(op["edges"]) for op in kept_ops)
+    if edge_total == 0:
+        raise click.ClickException(
+            "relate artifact has no valid edges "
+            f"({len(rejected)} rejected — see rejected_edges[])"
+        )
     return {
-        "operation_count": len(operations),
+        "operation_count": len(kept_ops),
         "edge_count": edge_total,
         "singleton_event_count": singleton_events,
         "off_lattice_object_count": off_lattice,
         "direct_count": direct_count,
         "indirect_count": indirect_count,
         "kind_correction_count": kind_corrections,
+        "coerced_anchor_count": coerced_anchors,
+        "rejected_edge_count": len(rejected),
+        "dropped_operation_count": dropped_ops,
         "coined_relations": coined_relations,
     }
 
@@ -1456,6 +1581,25 @@ def _lattice_formal_names(lattice_artifact: dict) -> set[str]:
     return names
 
 
+def _mark_batch_failed(batch_id: str, stage: str, run_id: str | None,
+                       error: str) -> None:
+    """Record a failed batch in `batch_artifacts` so `status` and resume
+    logic can see it. Never clobbers an existing `complete` row."""
+    with db() as conn:
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT status FROM batch_artifacts WHERE batch_id=? AND stage=?",
+            (batch_id, stage),
+        ).fetchone()
+        if row and row["status"] == "complete":
+            return
+        set_batch_artifact(
+            cur, batch_id=batch_id, stage=stage, artifact_path="",
+            status="failed", run_id=run_id, attrs={"error": error[:500]},
+        )
+        conn.commit()
+
+
 def _batch_traced_target(batch_id: str | None) -> str | None:
     """The tracing target whose discover run created this batch — i.e.
     the artifact the batch's sources are *official for*. Recorded in
@@ -1512,9 +1656,14 @@ def commit_relations_artifact(
                     edge["traced_target"] = traced
                     stamped += 1
         stats["traced_target"] = traced
-    # Validation may have corrected dependency_kind labels in place and
-    # stamping adds provenance; the file on disk is the data, so persist.
-    if (stats.get("kind_correction_count") or stamped) and artifact_path:
+    # Validation may have corrected kinds, coerced anchors, or
+    # quarantined edges in place, and stamping adds provenance; the
+    # file on disk is the data, so persist any mutation.
+    if artifact_path and (stamped
+                          or stats.get("kind_correction_count")
+                          or stats.get("coerced_anchor_count")
+                          or stats.get("rejected_edge_count")
+                          or stats.get("dropped_operation_count")):
         atomic_write_json(artifact_path.resolve(), artifact)
     if batch_id and artifact_path:
         with db() as conn:
@@ -1643,6 +1792,8 @@ def run_relate(
         spawn = dispatch_spawn(run_id, prompt, model=planner_model,
                                label=f"relate {bid[:8]}")
         if spawn["exit_code"] != 0:
+            _mark_batch_failed(bid, "relate", run_id,
+                               f"planner exit {spawn['exit_code']}")
             return {"batch_id": bid, "status": "failed", "log_dir": spawn["log_dir"]}
         # Assemble JSONL → JSON
         try:
@@ -1650,6 +1801,7 @@ def run_relate(
                 events_path, batch_id=bid, batch_label=_batch_label(bid),
             )
         except click.ClickException as exc:
+            _mark_batch_failed(bid, "relate", run_id, str(exc))
             return {"batch_id": bid, "status": "failed",
                     "log_dir": spawn["log_dir"], "error": str(exc)}
         atomic_write_json(artifact_out, artifact)
@@ -1663,6 +1815,7 @@ def run_relate(
                 lattice_family_names=family_names,
             )
         except click.ClickException as exc:
+            _mark_batch_failed(bid, "relate", run_id, str(exc))
             return {"batch_id": bid, "status": "failed",
                     "log_dir": spawn["log_dir"], "error": str(exc)}
         result["batch_id"] = bid
@@ -2369,6 +2522,14 @@ def _merge_lattices(artifacts: list[dict]) -> tuple[dict, list[dict]]:
     return ({"groups": list(by_family.values())}, conflicts)
 
 
+def _endpoint_str(v: object) -> str:
+    """Edge endpoints are normally strings; tolerate dict-shaped
+    endpoints from older artifacts by pivoting to their formal_name."""
+    if isinstance(v, dict):
+        return v.get("formal_name") or v.get("name") or ""
+    return v or ""
+
+
 def _merge_relations(
     artifacts: list[dict],
 ) -> tuple[list[dict], dict[str, dict], list[dict]]:
@@ -2394,12 +2555,19 @@ def _merge_relations(
         ops = art.get("operations")
         edge_iter: list[tuple[str | None, dict]] = []
         if isinstance(ops, dict):
-            # Prior merge artifact: union its operations index; its
-            # reconciled edges already carry operation_ids.
+            # Flat-edge input: a prior merge artifact (`relations[]`) or
+            # a reconcile artifact (`edges[]`). Union its operations
+            # index and surfaced conflicts; its edges already carry
+            # operation_ids and provenance.
             for op_id, op in ops.items():
                 if isinstance(op, dict):
                     operations.setdefault(str(op_id), op)
-            edge_iter = [(None, e) for e in art.get("relations") or []
+            conflicts.extend(c for c in art.get("conflicts") or []
+                             if isinstance(c, dict))
+            flat = art.get("relations")
+            if not isinstance(flat, list):
+                flat = art.get("edges")
+            edge_iter = [(None, e) for e in flat or []
                          if isinstance(e, dict)]
         else:
             for i, op in enumerate(ops or []):
@@ -2416,78 +2584,72 @@ def _merge_relations(
                     if isinstance(edge, dict):
                         edge_iter.append((op_id, edge))
         for op_id, edge in edge_iter:
-                def _str(v):
-                    if isinstance(v, dict):
-                        return v.get("formal_name") or v.get("name") or ""
-                    return v or ""
-                key = (
-                    _str(edge.get("subject")),
-                    _str(edge.get("relation")),
-                    _str(edge.get("object")),
-                )
-                anchors = list(edge.get("anchor_list") or [])
-                traced_targets = [
-                    t for t in (edge.get("traced_targets")
-                                or ([edge["traced_target"]]
-                                    if edge.get("traced_target") else []))
-                ]
-                edge_op_ids = list(edge.get("operation_ids") or [])
-                if op_id and op_id not in edge_op_ids:
-                    edge_op_ids.append(op_id)
-                if key in by_key:
-                    target = by_key[key]
-                    target.setdefault("anchor_list", []).extend(anchors)
-                    for t in traced_targets:
-                        if t not in target.setdefault("traced_targets", []):
-                            target["traced_targets"].append(t)
-                    for oid in edge_op_ids:
-                        if oid not in target.setdefault("operation_ids", []):
-                            target["operation_ids"].append(oid)
-                    if edge.get("provenance_review"):
-                        target["provenance_review"] = True
-                    this_kind = edge.get("dependency_kind")
-                    if (this_kind and target.get("dependency_kind")
-                            and this_kind != target["dependency_kind"]):
-                        # Runs disagree on the kind of the same triple:
-                        # flag for review instead of silently keeping
-                        # the first writer's label.
-                        conflicts.append({
-                            "kind": "dependency_kind_variant",
-                            "subject": edge.get("subject"),
-                            "relation": edge.get("relation"),
-                            "object": edge.get("object"),
-                            "values": sorted({this_kind, target["dependency_kind"]}),
-                        })
-                    target_desc = target.get("description")
-                    this_desc = edge.get("description")
-                    if (this_desc and target_desc and this_desc != target_desc
-                            and this_desc not in (target.get("description_variants") or [])):
-                        variants = list(target.get("description_variants") or [])
-                        if target_desc not in variants:
-                            variants.append(target_desc)
-                        variants.append(this_desc)
-                        target["description_variants"] = variants
-                        conflicts.append({
-                            "kind": "description_variant",
-                            "subject": edge.get("subject"),
-                            "relation": edge.get("relation"),
-                            "object": edge.get("object"),
-                            "variants": variants,
-                        })
-                else:
-                    merged = {
+            key = (
+                _endpoint_str(edge.get("subject")),
+                _endpoint_str(edge.get("relation")),
+                _endpoint_str(edge.get("object")),
+            )
+            anchors = list(edge.get("anchor_list") or [])
+            traced_targets = [
+                t for t in (edge.get("traced_targets")
+                            or ([edge["traced_target"]]
+                                if edge.get("traced_target") else []))
+            ]
+            edge_op_ids = list(edge.get("operation_ids") or [])
+            if op_id and op_id not in edge_op_ids:
+                edge_op_ids.append(op_id)
+            if key in by_key:
+                target = by_key[key]
+                target.setdefault("anchor_list", []).extend(anchors)
+                for t in traced_targets:
+                    if t not in target.setdefault("traced_targets", []):
+                        target["traced_targets"].append(t)
+                for oid in edge_op_ids:
+                    if oid not in target.setdefault("operation_ids", []):
+                        target["operation_ids"].append(oid)
+                if edge.get("provenance_review"):
+                    target["provenance_review"] = True
+                this_kind = edge.get("dependency_kind")
+                if (this_kind and target.get("dependency_kind")
+                        and this_kind != target["dependency_kind"]):
+                    # Runs disagree on the kind of the same triple:
+                    # flag for review instead of silently keeping
+                    # the first writer's label.
+                    conflicts.append({
+                        "kind": "dependency_kind_variant",
                         "subject": edge.get("subject"),
                         "relation": edge.get("relation"),
-                        "dependency_kind": edge.get("dependency_kind"),
                         "object": edge.get("object"),
-                        "description": edge.get("description"),
-                        "anchor_list": anchors,
-                        "traced_targets": traced_targets,
-                        "operation_ids": edge_op_ids,
-                    }
-                    if edge.get("provenance_review"):
-                        merged["provenance_review"] = True
-                    by_key[key] = merged
+                        "values": sorted({this_kind, target["dependency_kind"]}),
+                    })
+                target_desc = target.get("description")
+                this_desc = edge.get("description")
+                if (this_desc and target_desc and this_desc != target_desc
+                        and this_desc not in (target.get("description_variants") or [])):
+                    variants = list(target.get("description_variants") or [])
+                    if target_desc not in variants:
+                        variants.append(target_desc)
+                    variants.append(this_desc)
+                    target["description_variants"] = variants
+                    conflicts.append({
+                        "kind": "description_variant",
+                        "subject": edge.get("subject"),
+                        "relation": edge.get("relation"),
+                        "object": edge.get("object"),
+                        "variants": variants,
+                    })
+            else:
+                # Keep every non-private field the source edge carries —
+                # reconcile inputs add subsumed_by / subsumes /
+                # corroboration_count / description_variants, and those
+                # must survive into the merged artifact. Union fields
+                # get fresh copies.
+                merged = {k: v for k, v in edge.items()
+                          if not k.startswith("_") and k != "traced_target"}
+                merged["anchor_list"] = anchors
+                merged["traced_targets"] = traced_targets
+                merged["operation_ids"] = edge_op_ids
+                by_key[key] = merged
     return (list(by_key.values()), operations, conflicts)
 
 
@@ -2531,18 +2693,28 @@ def run_merge(
 
     if not sources:
         # Bare `modsleuth run merge`: default to the current storage's
-        # latest lattice and every completed per-batch relate artifact —
-        # the same resolution relate and reconcile use.
+        # latest lattice, and for relations prefer the latest reconcile
+        # artifact — its subsumption marks and sibling conflicts must
+        # survive into the final graph. Fall back to the completed
+        # per-batch relate artifacts when reconcile hasn't run.
         sources = [str(_latest_lattice_artifact_path())]
         if relations_sources is None:
-            rows = all_rows(
-                "SELECT artifact_path FROM batch_artifacts "
-                "WHERE stage='relate' AND status='complete'"
+            recon = sorted(
+                (config.STORAGE / config.RUNS_SUBDIR).glob(
+                    f"*/{config.RECONCILE_ARTIFACT_FILE}"),
+                key=lambda p: p.stat().st_mtime, reverse=True,
             )
-            relations_sources = [
-                row["artifact_path"] for row in rows
-                if row["artifact_path"] and Path(row["artifact_path"]).exists()
-            ]
+            if recon:
+                relations_sources = [str(recon[0])]
+            else:
+                rows = all_rows(
+                    "SELECT artifact_path FROM batch_artifacts "
+                    "WHERE stage='relate' AND status='complete'"
+                )
+                relations_sources = [
+                    row["artifact_path"] for row in rows
+                    if row["artifact_path"] and Path(row["artifact_path"]).exists()
+                ]
     lattice_artifacts = [read_json(s) for s in sources]
     merged_lattice, lattice_conflicts = _merge_lattices(lattice_artifacts)
 
@@ -2637,8 +2809,10 @@ def run_expand(
     subagent_model: str = config.CLAUDE_MODEL,
     skip: tuple[str, ...] = (),
 ) -> dict:
-    """Run the full pipeline against `node` as a fresh target. Default
-    skips none; pass `skip=("relate",)` to stop earlier. Each stage's
+    """Run discover → reconcile against `node` as a fresh target inside
+    the current storage. Deliberately stops before triage/merge — the
+    caller (operator or recursive driver) merges once after its batch
+    of expansions. Pass `skip=(...)` to skip stages. Each stage's
     result is captured in the returned dict.
     """
     out: dict[str, Any] = {"node": node, "stages": {}}

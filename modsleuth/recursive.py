@@ -256,13 +256,25 @@ def expand_seed(seed: str, depth: int, top_k: int,
 
     print(f"\n=== seed={seed}  storage={seed_storage}  strategy={strategy} ===", flush=True)
 
-    # Depth-1: full base pipeline against the seed.
+    # Depth-1: full base pipeline against the seed — unless this seed
+    # storage already holds a merged graph (resuming after an abort or
+    # rate limit), in which case the base artifacts are reused and we
+    # go straight to expansion rounds.
     _run(env, "init")
-    _run(env, "run", "discover", "--target", seed, *model_flags)
-    for stage in ("extract", "organize", "audit", "relate",
-                  "reconcile", "triage", "merge"):
-        _run(env, "run", stage,
-             *(model_flags if stage in llm_stages else []))
+    try:
+        existing = _latest_merge_path(seed_storage)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        print(f"[resume] found {existing}\n"
+              "         skipping the base pipeline — point --storage-root "
+              "at a fresh directory for a clean run", flush=True)
+    else:
+        _run(env, "run", "discover", "--target", seed, *model_flags)
+        for stage in ("extract", "organize", "audit", "relate",
+                      "reconcile", "triage", "merge"):
+            _run(env, "run", stage,
+                 *(model_flags if stage in llm_stages else []))
 
     expanded: set[str] = {seed}
     beam_history: dict[str, int] = {}  # only used by beam

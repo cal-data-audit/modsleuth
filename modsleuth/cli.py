@@ -6,6 +6,7 @@ import click
 
 from . import config
 from .pipeline import (
+    install_signal_handlers,
     names_packet,
     run_audit,
     run_discover,
@@ -23,6 +24,51 @@ from .store import all_rows, db, emit_json, loads, read_json
 @click.group()
 def main():
     """ModSleuth: agentic recursive dependency tracing for LLM releases."""
+    install_signal_handlers()
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens",
+               "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _fmt_tokens(n: int) -> str:
+    if not n:
+        return "—"
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}K"
+    return str(n)
+
+
+def _fmt_duration(s: float) -> str:
+    if not s:
+        return "—"
+    if s < 90:
+        return f"{s:.0f}s"
+    if s < 5400:
+        return f"{s / 60:.0f}m"
+    return f"{s / 3600:.1f}h"
+
+
+def _usage_totals(rows: list) -> dict:
+    """Sum token/cost/elapsed usage over runs-table rows (attrs JSON)."""
+    tot = {"runs": 0, "cost": 0.0, "elapsed": 0.0,
+           **{k: 0 for k in _USAGE_KEYS}}
+    for row in rows:
+        attrs = loads(row["attrs"], default={}) or {}
+        tot["runs"] += 1
+        for k in _USAGE_KEYS:
+            v = attrs.get(k)
+            if isinstance(v, (int, float)):
+                tot[k] += int(v)
+        if isinstance(attrs.get("cost_usd"), (int, float)):
+            tot["cost"] += float(attrs["cost_usd"])
+        if isinstance(attrs.get("elapsed_s"), (int, float)):
+            tot["elapsed"] += float(attrs["elapsed_s"])
+    return tot
 
 
 @main.command()
@@ -109,6 +155,13 @@ def status():
         ]
         return " · ".join(parts)
 
+    def stage_done(stage: str) -> bool:
+        # Per-batch stages are done only when EVERY batch is complete —
+        # an ended run with failed/missing batches is partial, not done.
+        if stage in ("extract", "relate"):
+            return bool(n_batches) and per_batch[stage].get("complete", 0) >= n_batches
+        return stage in last
+
     click.echo(f"storage: {config.STORAGE}")
     click.echo(f"db:      {config.DB_PATH}")
     click.echo("")
@@ -116,20 +169,112 @@ def status():
     for stage in stage_order:
         run = last.get(stage)
         when = str(run["ended_at"])[:19].replace("T", " ") if run else "—"
-        mark = "✓" if run else "·"
+        if stage_done(stage):
+            mark = "✓"
+        elif run or per_batch.get(stage):
+            mark = "◐"
+        else:
+            mark = "·"
         click.echo(f"  {mark} {stage:<9} {when:<20} {detail(stage)}".rstrip())
-        if run is None and next_stage is None:
+        if next_stage is None and not stage_done(stage):
             next_stage = stage
+    tot = _usage_totals(all_rows("SELECT attrs FROM runs"))
+    if tot["input_tokens"] or tot["output_tokens"] or tot["cost"]:
+        cost = f" · ${tot['cost']:.2f} reported" if tot["cost"] else ""
+        click.echo(
+            f"\nusage: {_fmt_tokens(tot['input_tokens'])} in / "
+            f"{_fmt_tokens(tot['output_tokens'])} out · "
+            f"{_fmt_tokens(tot['cache_read_input_tokens'])} cache-read"
+            f"{cost} — `modsleuth usage` for the breakdown"
+        )
     failed_batches = sum(
         per_batch[st].get("failed", 0) for st in ("extract", "relate")
     )
     if failed_batches:
-        click.echo(f"\n! {failed_batches} failed batch(es) — re-run that "
-                   "stage to retry just those")
+        click.echo(f"\n! {failed_batches} failed batch(es) — re-running that "
+                   "stage retries just those (completed batches are skipped)")
     if next_stage:
         cmd = ("modsleuth run discover --target <model>"
                if next_stage == "discover" else f"modsleuth run {next_stage}")
         click.echo(f"\nnext: {cmd}")
+
+
+@main.command()
+@click.option("--runs", "show_runs", is_flag=True,
+              help="List every run with its own usage.")
+def usage(show_runs: bool):
+    """Token usage and reported cost per stage for the current storage.
+
+    Numbers come from each planner run's own stream accounting
+    (subagent turns included). Aborted or watchdog-killed runs report
+    the usage accumulated before they stopped. Pure-Python stages and
+    the dedup pipeline's one-shot workers spend no planner tokens and
+    show dashes.
+    """
+    rows = all_rows(
+        "SELECT id, stage, seed, started_at, attrs FROM runs ORDER BY started_at"
+    )
+    if not rows:
+        click.echo("no runs recorded in this storage")
+        return
+    stage_order = ("discover", "extract", "organize", "audit",
+                   "relate", "reconcile", "triage", "merge", "expand")
+    # Retry attempts are separate runs (stage='retry', seed=<original
+    # run id>); attribute their spend to the stage they retried.
+    stage_of = {row["id"]: row["stage"] for row in rows}
+    by_stage: dict[str, list] = {}
+    for row in rows:
+        stage = row["stage"] or "?"
+        if stage == "retry":
+            stage = stage_of.get(row["seed"]) or "retry"
+        by_stage.setdefault(stage, []).append(row)
+    ordered = ([s for s in stage_order if s in by_stage]
+               + sorted(set(by_stage) - set(stage_order)))
+
+    click.echo(f"storage: {config.STORAGE}\n")
+    header = (f"  {'stage':<10} {'runs':>4} {'input':>8} {'output':>8} "
+              f"{'cache-wr':>9} {'cache-rd':>9} {'cost':>8} {'time':>6}")
+    click.echo(header)
+    click.echo("  " + "-" * (len(header) - 2))
+    for stage in ordered:
+        t = _usage_totals(by_stage[stage])
+        cost = f"${t['cost']:.2f}" if t["cost"] else "—"
+        click.echo(
+            f"  {stage:<10} {t['runs']:>4} {_fmt_tokens(t['input_tokens']):>8} "
+            f"{_fmt_tokens(t['output_tokens']):>8} "
+            f"{_fmt_tokens(t['cache_creation_input_tokens']):>9} "
+            f"{_fmt_tokens(t['cache_read_input_tokens']):>9} "
+            f"{cost:>8} {_fmt_duration(t['elapsed']):>6}"
+        )
+    tot = _usage_totals(rows)
+    cost = f"${tot['cost']:.2f}" if tot["cost"] else "—"
+    click.echo("  " + "-" * (len(header) - 2))
+    click.echo(
+        f"  {'total':<10} {tot['runs']:>4} {_fmt_tokens(tot['input_tokens']):>8} "
+        f"{_fmt_tokens(tot['output_tokens']):>8} "
+        f"{_fmt_tokens(tot['cache_creation_input_tokens']):>9} "
+        f"{_fmt_tokens(tot['cache_read_input_tokens']):>9} "
+        f"{cost:>8} {_fmt_duration(tot['elapsed']):>6}"
+    )
+    if show_runs:
+        click.echo("")
+        for row in rows:
+            attrs = loads(row["attrs"], default={}) or {}
+            t = _usage_totals([row])
+            when = str(row["started_at"])[:19].replace("T", " ")
+            model = str(attrs.get("model") or "")[:28]
+            stalled = "  [stalled]" if attrs.get("killed_for_stall") else ""
+            cost = f"${t['cost']:.2f}" if t["cost"] else "—"
+            stage = row["stage"] or "?"
+            if stage == "retry":
+                # `*` marks a retry attempt of the named stage.
+                stage = (stage_of.get(row["seed"]) or "retry") + "*"
+            click.echo(
+                f"  {when}  {stage:<10} {model:<28} "
+                f"{_fmt_tokens(t['input_tokens']):>8} in "
+                f"{_fmt_tokens(t['output_tokens']):>8} out "
+                f"{cost:>8} {_fmt_duration(t['elapsed']):>6}{stalled}"
+            )
 
 
 @main.group()
@@ -349,7 +494,15 @@ def merge_cmd(artifact_path: str | None, sources: tuple[str, ...],
               help="Skip one or more stages. Pass multiple times to skip several.")
 def expand_cmd(node: str, planner_model: str, subagent_model: str,
                skip: tuple[str, ...]):
-    """Run the full pipeline against an upstream node as a fresh target."""
+    """Run discover → reconcile against an upstream node as a fresh
+    target, within the current storage.
+
+    Expansion deliberately stops at reconcile: run `modsleuth run
+    merge` afterwards to fold the new edges into the graph (and
+    `modsleuth run triage` to re-gate further expansion). The
+    recursive driver batches several expands per round and does both
+    once per round.
+    """
     emit_json(run_expand(
         node=node,
         planner_model=planner_model,

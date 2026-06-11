@@ -229,3 +229,4 @@ pyproject.toml    package metadata
 - Send `Ctrl-C` to the top-level `modsleuth` process to stop a run.
 - This README is for using the code. Methodological details are in the
   paper.
+- Based on our internal tests, we suggest using `claude-opus-4-6[1M]` as the planner model and `claude-sonnet-4-6[1M]` as the subagent model (although the artifacts created in our paper used Claude Opus 4.7 and Claude Sonnet 4.6, respectively).

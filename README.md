@@ -5,9 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="https://modsleuth.cal-data-audit.org"><strong>Visualization</strong></a>
-  ·
-  <span>Code release for <em>Which Models Are Our Models Built On? Auditing Invisible Dependencies in Modern LLMs</em></span>
+  <a href="https://modsleuth.cal-data-audit.org"><img src="https://img.shields.io/badge/demo-cal--data--audit-blue" alt="demo"></a>
+  <a href="https://arxiv.org/abs/2606.12385"><img src="https://img.shields.io/badge/paper-2606.12385-red" alt="paper"></a>
 </p>
 
 ModSleuth starts from a target model release, reads its public artifacts

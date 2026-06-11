@@ -69,14 +69,6 @@ def hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def truncate(value: str | None, limit: int) -> str | None:
-    if value is None or len(value) <= limit:
-        return value
-    suffix = " ... [truncated]"
-    keep = max(limit - len(suffix), 0)
-    return value[:keep].rstrip() + suffix[:limit]
-
-
 _MIGRATED: set[str] = set()
 
 
@@ -380,7 +372,12 @@ def upsert_batch_by_fingerprint(
     label: str | None,
     summary: str | None,
     file_map: dict[str, str],
+    extra_attrs: dict | None = None,
 ) -> tuple[str, bool]:
+    """`extra_attrs` entries are recorded once per batch (first writer
+    wins): a batch reused by a later run keeps the attrs of the run
+    that created it, matching the fact that its per-batch stages only
+    ran under that first run's context."""
     existing = cur.execute(
         "SELECT * FROM batches WHERE content_fingerprint=?",
         (fingerprint,),
@@ -395,6 +392,9 @@ def upsert_batch_by_fingerprint(
                 merged[filename] = sid
                 existing_sids.add(sid)
         attrs["file_map"] = merged
+        for k, v in (extra_attrs or {}).items():
+            if v is not None:
+                attrs.setdefault(k, v)
         cur.execute(
             """UPDATE batches
                   SET label=COALESCE(label, ?), summary=COALESCE(summary, ?),
@@ -409,11 +409,15 @@ def upsert_batch_by_fingerprint(
             )
         return existing["id"], False
     batch_id = new_id()
+    initial_attrs = {"file_map": file_map}
+    for k, v in (extra_attrs or {}).items():
+        if v is not None:
+            initial_attrs[k] = v
     cur.execute(
         """INSERT INTO batches
            (id, label, summary, content_fingerprint, attrs, created_at, updated_at)
            VALUES (?,?,?,?,?,?,?)""",
-        (batch_id, label, summary, fingerprint, dumps({"file_map": file_map}), timestamp, timestamp),
+        (batch_id, label, summary, fingerprint, dumps(initial_attrs), timestamp, timestamp),
     )
     for ordinal, sid in enumerate(source_ids):
         cur.execute(

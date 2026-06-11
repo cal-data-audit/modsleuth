@@ -23,14 +23,16 @@ PROMPTS_DIR = ROOT / "modsleuth" / "prompts"
 if not PROMPTS_DIR.exists():
     PROMPTS_DIR = Path(sysconfig.get_path("data")) / "share" / "modsleuth" / "prompts"
 
-load_dotenv(ROOT / ".env")
+load_dotenv(Path.cwd() / ".env")
 
 # Environment variable names
 MODSLEUTH_STORAGE_ENV = "MODSLEUTH_STORAGE"
 MODSLEUTH_PATH_ENV = "MODSLEUTH_PATH"
 MODSLEUTH_RUN_ID_ENV = "MODSLEUTH_RUN_ID"
 
-STORAGE = Path(os.environ.get(MODSLEUTH_STORAGE_ENV) or ROOT / "storage").resolve()
+# Storage defaults to ./storage in the invoking directory (like `git init`);
+# spawned children always receive the resolved path via MODSLEUTH_STORAGE.
+STORAGE = Path(os.environ.get(MODSLEUTH_STORAGE_ENV) or Path.cwd() / "storage").resolve()
 DB_PATH = Path(os.environ.get(MODSLEUTH_PATH_ENV) or STORAGE / "graph.db").resolve()
 
 # Storage layout — directory names under STORAGE and run_root
@@ -42,15 +44,10 @@ BATCH_SUBDIR = "batch"
 
 # Per-run files (under STORAGE/runs/<run_id>/)
 RUN_PROMPT_FILE = "prompt.md"
-RUN_STDOUT_FILE = "stdout.txt"      # codex (plain text)
 RUN_STREAM_FILE = "stream.jsonl"    # claude (--output-format stream-json)
 RUN_STDERR_FILE = "stderr.txt"
 RUN_INPUT_FILE = "input.json"
 BATCH_MANIFEST_FILE = "MANIFEST.txt"
-
-# Pipeline stages (execution order)
-STAGE_NAMES = ("discover", "extract", "organize", "audit",
-               "relate", "reconcile", "triage", "merge")
 
 # Per-stage artifact filenames written under each run_root
 DISCOVER_ARTIFACT_FILE = "discover_artifact.json"
@@ -72,30 +69,28 @@ SKIP_DIRS = {"__pycache__", "node_modules", "venv", ".venv", ".git"}
 SQLITE_BUSY_TIMEOUT_S = 30.0
 PROCESS_KILL_GRACE_S = 5.0
 MAX_PARALLEL_BATCHES = int(os.environ.get("MODSLEUTH_MAX_PARALLEL_BATCHES", "32"))
+# Watchdog: kill a planner whose output stream stays silent this long.
+# Planners quietly waiting on long subagents are silent too, so this
+# must stay far above legitimate subagent runtimes.
+STREAM_SILENCE_LIMIT_S = float(os.environ.get("MODSLEUTH_STREAM_SILENCE_S", "1800"))
 HASH_CHUNK_BYTES = 1 << 20   # streaming chunk size for sha256_file
 
-# Models
+# Models. Names are free-form: any alias (`opus`, `sonnet`, `haiku`)
+# or full model ID the `claude` CLI accepts — for the stage planner
+# and for the subagents the planner dispatches via the Task tool.
 CLAUDE_MODEL = os.environ.get("MODSLEUTH_CLAUDE_MODEL", "opus")
-CODEX_MODEL = os.environ.get("MODSLEUTH_CODEX_MODEL", "gpt-5.5")
-CODEX_EFFORT_CHOICES = ("low", "medium", "high", "xhigh")
 
-# CLI-restricted model choices. The planner is always Claude (only
-# Claude can drive the Task tool / artifact-writing flow); the
-# subagent may be Claude or Codex.
-PLANNER_CHOICES = ("opus", "sonnet")
-SUBAGENT_CHOICES = (
-    "opus", "sonnet",
-    "codex-low", "codex-medium", "codex-high", "codex-xhigh",
-)
-
-# `{{subagent_prompt}}` templates rendered by
-# `pipeline.subagent_prompt_for(model)`. The planner reads one of
-# these to learn how to dispatch sub-work this run.
+# `{{subagent_prompt}}` template rendered by
+# `pipeline.subagent_prompt_for(model)`. The planner reads this to
+# learn how to dispatch sub-work this run.
 
 SUBAGENT_PROMPT_CLAUDE = (
     "## Subagent dispatch (Task tool)\n"
     "\n"
-    "The Task tool is available — subagents run as `{model}`. "
+    "The Task tool is available. Pass `model: \"{model}\"` on every "
+    "Task call so each subagent runs as `{model}` — use that exact "
+    "string, never a shortened alias like `sonnet` (aliases resolve "
+    "to a different context tier). "
     "Use them when the work has parallel structure: a directory "
     "of sources, a list of family buckets, anything where one "
     "unit can be analyzed without reading the others. Each Task "
@@ -112,32 +107,4 @@ SUBAGENT_PROMPT_CLAUDE = (
     "from this prompt verbatim; rule erosion at dispatch is the "
     "main cause of subagent output drifting from the rules you "
     "were given."
-)
-
-SUBAGENT_PROMPT_CODEX = (
-    "You are running as the **orchestrator**. Plan and synthesize "
-    "the final artifact yourself, but delegate every unit of "
-    "reading-and-analysis to a codex subagent. **Do NOT call the "
-    "`Agent` or `Task` tool** — they are off-policy for this run. "
-    "Subagents are dispatched ONLY via the codex CLI.\n"
-    "\n"
-    "Each codex subagent runs in a **fresh process with no shared "
-    "context** — it cannot see your prompt or your running state. "
-    "Brief it like a stranger: include filesystem scope, schema, "
-    "rules, and the completion contract in its prompt.\n"
-    "\n"
-    "## CLI invocation\n"
-    "\n"
-    "```bash\n"
-    "codex exec -m {codex_model} \\\n"
-    "  -c model_reasoning_effort={effort} \\\n"
-    "  --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \\\n"
-    "  \"<self-contained prompt: scope + schema + rules + completion>\"\n"
-    "```\n"
-    "\n"
-    "Dispatch and wait for codex subagents in **one** Bash "
-    "invocation, not across multiple. Pass `timeout: 600000` "
-    "(10 minutes) on this Bash call. The Bash tool's default "
-    "2-minute timeout will kill a long `wait` and leave codex "
-    "grandchildren orphaned in the process tree."
 )

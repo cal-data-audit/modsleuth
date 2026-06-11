@@ -6,6 +6,7 @@ import click
 
 from . import config
 from .pipeline import (
+    install_signal_handlers,
     names_packet,
     run_audit,
     run_discover,
@@ -23,6 +24,51 @@ from .store import all_rows, db, emit_json, loads, read_json
 @click.group()
 def main():
     """ModSleuth: agentic recursive dependency tracing for LLM releases."""
+    install_signal_handlers()
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens",
+               "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _fmt_tokens(n: int) -> str:
+    if not n:
+        return "—"
+    if n >= 1_000_000_000:
+        return f"{n / 1e9:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}K"
+    return str(n)
+
+
+def _fmt_duration(s: float) -> str:
+    if not s:
+        return "—"
+    if s < 90:
+        return f"{s:.0f}s"
+    if s < 5400:
+        return f"{s / 60:.0f}m"
+    return f"{s / 3600:.1f}h"
+
+
+def _usage_totals(rows: list) -> dict:
+    """Sum token/cost/elapsed usage over runs-table rows (attrs JSON)."""
+    tot = {"runs": 0, "cost": 0.0, "elapsed": 0.0,
+           **{k: 0 for k in _USAGE_KEYS}}
+    for row in rows:
+        attrs = loads(row["attrs"], default={}) or {}
+        tot["runs"] += 1
+        for k in _USAGE_KEYS:
+            v = attrs.get(k)
+            if isinstance(v, (int, float)):
+                tot[k] += int(v)
+        if isinstance(attrs.get("cost_usd"), (int, float)):
+            tot["cost"] += float(attrs["cost_usd"])
+        if isinstance(attrs.get("elapsed_s"), (int, float)):
+            tot["elapsed"] += float(attrs["elapsed_s"])
+    return tot
 
 
 @main.command()
@@ -46,11 +92,189 @@ def init(fresh: bool, yes: bool, i_mean_it: bool):
 
 
 @main.command()
-def summary():
-    """Show table counts."""
-    tables = ("runs", "sources", "batches", "batch_artifacts", "names")
-    counts = {table: all_rows(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"] for table in tables}
-    emit_json({"counts": counts})
+def status():
+    """Show pipeline progress for the current storage.
+
+    One line per stage: when it last completed and its headline
+    numbers (batch progress, item/edge counts, conflicts, provenance
+    flags), plus a suggested next command.
+    """
+    stage_order = ("discover", "extract", "organize", "audit",
+                   "relate", "reconcile", "triage", "merge")
+    last: dict = {}
+    for row in all_rows(
+        "SELECT stage, started_at, ended_at, attrs FROM runs "
+        "WHERE ended_at IS NOT NULL ORDER BY started_at"
+    ):
+        if row["stage"] in stage_order:
+            last[row["stage"]] = row
+
+    n_batches = all_rows("SELECT COUNT(*) AS n FROM batches")[0]["n"]
+    per_batch: dict[str, dict[str, int]] = {}
+    unit_totals: dict[str, int] = {}
+    for st in ("extract", "relate"):
+        per_batch[st] = {}
+        key = "edge_count" if st == "relate" else "names_committed"
+        for row in all_rows(
+            "SELECT status, attrs FROM batch_artifacts WHERE stage=?", (st,)
+        ):
+            per_batch[st][row["status"]] = per_batch[st].get(row["status"], 0) + 1
+            attrs = loads(row["attrs"], default={}) or {}
+            if row["status"] == "complete" and isinstance(attrs.get(key), int):
+                unit_totals[st] = unit_totals.get(st, 0) + attrs[key]
+
+    def detail(stage: str) -> str:
+        run = last.get(stage)
+        attrs = (loads(run["attrs"], default={}) or {}) if run else {}
+        if stage in ("extract", "relate"):
+            if not n_batches:
+                return ""
+            done = per_batch[stage].get("complete", 0)
+            bad = per_batch[stage].get("failed", 0)
+            out = f"{done}/{n_batches} batches complete"
+            if bad:
+                out += f", {bad} failed"
+            if stage in unit_totals:
+                unit = "edges" if stage == "relate" else "mentions"
+                out += f" · {unit_totals[stage]:,} {unit}"
+            return out
+        picks = (
+            ("batch_count", "batches"),
+            ("item_count", "items"), ("group_count", "groups"),
+            ("total_edge_count", "edges"), ("relation_count", "edges"),
+            ("operation_count", "operations"),
+            ("conflict_count", "conflicts"),
+            ("provenance_review_count", "provenance flags"),
+            ("auto_expand", "auto_expand"), ("decline", "decline"),
+            ("manual", "manual"),
+        )
+        parts = [
+            f"{attrs[k]:,} {label}"
+            for k, label in picks
+            if isinstance(attrs.get(k), int)
+        ]
+        return " · ".join(parts)
+
+    def stage_done(stage: str) -> bool:
+        # Per-batch stages are done only when EVERY batch is complete —
+        # an ended run with failed/missing batches is partial, not done.
+        if stage in ("extract", "relate"):
+            return bool(n_batches) and per_batch[stage].get("complete", 0) >= n_batches
+        return stage in last
+
+    click.echo(f"storage: {config.STORAGE}")
+    click.echo(f"db:      {config.DB_PATH}")
+    click.echo("")
+    next_stage = None
+    for stage in stage_order:
+        run = last.get(stage)
+        when = str(run["ended_at"])[:19].replace("T", " ") if run else "—"
+        if stage_done(stage):
+            mark = "✓"
+        elif run or per_batch.get(stage):
+            mark = "◐"
+        else:
+            mark = "·"
+        click.echo(f"  {mark} {stage:<9} {when:<20} {detail(stage)}".rstrip())
+        if next_stage is None and not stage_done(stage):
+            next_stage = stage
+    tot = _usage_totals(all_rows("SELECT attrs FROM runs"))
+    if tot["input_tokens"] or tot["output_tokens"] or tot["cost"]:
+        cost = f" · ${tot['cost']:.2f} reported" if tot["cost"] else ""
+        click.echo(
+            f"\nusage: {_fmt_tokens(tot['input_tokens'])} in / "
+            f"{_fmt_tokens(tot['output_tokens'])} out · "
+            f"{_fmt_tokens(tot['cache_read_input_tokens'])} cache-read"
+            f"{cost} — `modsleuth usage` for the breakdown"
+        )
+    failed_batches = sum(
+        per_batch[st].get("failed", 0) for st in ("extract", "relate")
+    )
+    if failed_batches:
+        click.echo(f"\n! {failed_batches} failed batch(es) — re-running that "
+                   "stage retries just those (completed batches are skipped)")
+    if next_stage:
+        cmd = ("modsleuth run discover --target <model>"
+               if next_stage == "discover" else f"modsleuth run {next_stage}")
+        click.echo(f"\nnext: {cmd}")
+
+
+@main.command()
+@click.option("--runs", "show_runs", is_flag=True,
+              help="List every run with its own usage.")
+def usage(show_runs: bool):
+    """Token usage and reported cost per stage for the current storage.
+
+    Numbers come from each planner run's own stream accounting
+    (subagent turns included). Aborted or watchdog-killed runs report
+    the usage accumulated before they stopped. Pure-Python stages and
+    the dedup pipeline's one-shot workers spend no planner tokens and
+    show dashes.
+    """
+    rows = all_rows(
+        "SELECT id, stage, seed, started_at, attrs FROM runs ORDER BY started_at"
+    )
+    if not rows:
+        click.echo("no runs recorded in this storage")
+        return
+    stage_order = ("discover", "extract", "organize", "audit",
+                   "relate", "reconcile", "triage", "merge", "expand")
+    # Retry attempts are separate runs (stage='retry', seed=<original
+    # run id>); attribute their spend to the stage they retried.
+    stage_of = {row["id"]: row["stage"] for row in rows}
+    by_stage: dict[str, list] = {}
+    for row in rows:
+        stage = row["stage"] or "?"
+        if stage == "retry":
+            stage = stage_of.get(row["seed"]) or "retry"
+        by_stage.setdefault(stage, []).append(row)
+    ordered = ([s for s in stage_order if s in by_stage]
+               + sorted(set(by_stage) - set(stage_order)))
+
+    click.echo(f"storage: {config.STORAGE}\n")
+    header = (f"  {'stage':<10} {'runs':>4} {'input':>8} {'output':>8} "
+              f"{'cache-wr':>9} {'cache-rd':>9} {'cost':>8} {'time':>6}")
+    click.echo(header)
+    click.echo("  " + "-" * (len(header) - 2))
+    for stage in ordered:
+        t = _usage_totals(by_stage[stage])
+        cost = f"${t['cost']:.2f}" if t["cost"] else "—"
+        click.echo(
+            f"  {stage:<10} {t['runs']:>4} {_fmt_tokens(t['input_tokens']):>8} "
+            f"{_fmt_tokens(t['output_tokens']):>8} "
+            f"{_fmt_tokens(t['cache_creation_input_tokens']):>9} "
+            f"{_fmt_tokens(t['cache_read_input_tokens']):>9} "
+            f"{cost:>8} {_fmt_duration(t['elapsed']):>6}"
+        )
+    tot = _usage_totals(rows)
+    cost = f"${tot['cost']:.2f}" if tot["cost"] else "—"
+    click.echo("  " + "-" * (len(header) - 2))
+    click.echo(
+        f"  {'total':<10} {tot['runs']:>4} {_fmt_tokens(tot['input_tokens']):>8} "
+        f"{_fmt_tokens(tot['output_tokens']):>8} "
+        f"{_fmt_tokens(tot['cache_creation_input_tokens']):>9} "
+        f"{_fmt_tokens(tot['cache_read_input_tokens']):>9} "
+        f"{cost:>8} {_fmt_duration(tot['elapsed']):>6}"
+    )
+    if show_runs:
+        click.echo("")
+        for row in rows:
+            attrs = loads(row["attrs"], default={}) or {}
+            t = _usage_totals([row])
+            when = str(row["started_at"])[:19].replace("T", " ")
+            model = str(attrs.get("model") or "")[:28]
+            stalled = "  [stalled]" if attrs.get("killed_for_stall") else ""
+            cost = f"${t['cost']:.2f}" if t["cost"] else "—"
+            stage = row["stage"] or "?"
+            if stage == "retry":
+                # `*` marks a retry attempt of the named stage.
+                stage = (stage_of.get(row["seed"]) or "retry") + "*"
+            click.echo(
+                f"  {when}  {stage:<10} {model:<28} "
+                f"{_fmt_tokens(t['input_tokens']):>8} in "
+                f"{_fmt_tokens(t['output_tokens']):>8} out "
+                f"{cost:>8} {_fmt_duration(t['elapsed']):>6}{stalled}"
+            )
 
 
 @main.group()
@@ -64,10 +288,12 @@ def run():
               help="Ingest an existing discover artifact instead of launching an agent.")
 @click.option("--workspace", "workspace_dir",
               help="Workspace holding paths referenced by --artifact.")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 def discover_cmd(target: str, artifact_path: str | None, workspace_dir: str | None,
                  planner_model: str, subagent_model: str):
     emit_json(run_discover(
@@ -83,14 +309,19 @@ def discover_cmd(target: str, artifact_path: str | None, workspace_dir: str | No
 @click.option("--batch-id", help="Limit to one batch. Required when --artifact is used.")
 @click.option("--artifact", "artifact_path",
               help="Ingest an existing extract artifact instead of launching an agent.")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 @click.option("--max-workers", type=int,
               help="Override MODSLEUTH_MAX_PARALLEL_BATCHES for this process.")
+@click.option("--force", is_flag=True,
+              help="Redo all batches (by default, completed batches are skipped).")
 def extract_cmd(batch_id: str | None, artifact_path: str | None,
-                planner_model: str, subagent_model: str, max_workers: int | None):
+                planner_model: str, subagent_model: str, max_workers: int | None,
+                force: bool):
     if artifact_path and not batch_id:
         raise click.ClickException("--batch-id is required with --artifact")
     if max_workers:
@@ -100,16 +331,19 @@ def extract_cmd(batch_id: str | None, artifact_path: str | None,
         artifact_path=artifact_path,
         planner_model=planner_model,
         subagent_model=subagent_model,
+        force=force,
     ))
 
 
 @run.command("organize")
 @click.option("--artifact", "artifact_path",
               help="Ingest an existing organize artifact instead of launching an agent.")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 def organize_cmd(artifact_path: str | None, planner_model: str, subagent_model: str):
     emit_json(run_organize(
         artifact_path=artifact_path,
@@ -123,10 +357,12 @@ def organize_cmd(artifact_path: str | None, planner_model: str, subagent_model: 
               help="Ingest an existing audit artifact instead of launching an agent.")
 @click.option("--source", "source_path",
               help="Audit a specific lattice artifact (default: most recent organize or audit).")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 def audit_cmd(artifact_path: str | None, source_path: str | None,
               planner_model: str, subagent_model: str):
     """Read the latest lattice artifact, revise it, write the result."""
@@ -144,15 +380,19 @@ def audit_cmd(artifact_path: str | None, source_path: str | None,
               help="Ingest an existing relate artifact instead of launching an agent.")
 @click.option("--lattice", "lattice_path",
               help="Lattice path (default: most recent organize / audit).")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 @click.option("--max-workers", type=int,
               help="Override MODSLEUTH_MAX_PARALLEL_BATCHES for this process.")
+@click.option("--force", is_flag=True,
+              help="Redo all batches (by default, completed batches are skipped).")
 def relate_cmd(batch_id: str | None, artifact_path: str | None,
                lattice_path: str | None, planner_model: str,
-               subagent_model: str, max_workers: int | None):
+               subagent_model: str, max_workers: int | None, force: bool):
     """Per-batch lattice-anchored relation extraction."""
     if artifact_path and not batch_id:
         raise click.ClickException("--batch-id is required with --artifact")
@@ -164,6 +404,7 @@ def relate_cmd(batch_id: str | None, artifact_path: str | None,
         lattice_path=lattice_path,
         planner_model=planner_model,
         subagent_model=subagent_model,
+        force=force,
     ))
 
 
@@ -198,10 +439,12 @@ def reconcile_cmd(artifact_path: str | None, lattice_path: str | None,
               help="Lattice path (default: most recent organize / audit).")
 @click.option("--relations", "relations_path",
               help="Pre-aggregated relations file (default: aggregate completed relate artifacts).")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 def triage_cmd(artifact_path: str | None, lattice_path: str | None,
                relations_path: str | None,
                planner_model: str, subagent_model: str):
@@ -219,9 +462,13 @@ def triage_cmd(artifact_path: str | None, lattice_path: str | None,
 @click.option("--artifact", "artifact_path",
               help="Ingest an existing merge artifact for shape validation.")
 @click.option("--source", "sources", multiple=True,
-              help="Lattice artifact path. Pass multiple times for multiple runs.")
+              help="Lattice artifact path OR a prior merge_artifact.json "
+                   "(cross-seed merge). Pass multiple times. Default: this "
+                   "storage's latest organize/audit lattice.")
 @click.option("--relations", "relations_sources", multiple=True,
-              help="Relations artifact path. Pass multiple times.")
+              help="Relations artifact path. Pass multiple times. Default: "
+                   "relations carried by --source merge artifacts, or (bare "
+                   "merge) every completed relate artifact in this storage.")
 def merge_cmd(artifact_path: str | None, sources: tuple[str, ...],
               relations_sources: tuple[str, ...]):
     """Pure-Python cross-run merge of lattices and relations."""
@@ -235,17 +482,27 @@ def merge_cmd(artifact_path: str | None, sources: tuple[str, ...],
 @run.command("expand")
 @click.option("--node", required=True,
               help="Lattice formal_name to expand into a fresh discover-through-relate run.")
-@click.option("--planner-model", type=click.Choice(config.PLANNER_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
-@click.option("--subagent-model", type=click.Choice(config.SUBAGENT_CHOICES),
-              default=config.CLAUDE_MODEL, show_default=True)
+@click.option("--planner-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for the stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID.")
+@click.option("--subagent-model", default=config.CLAUDE_MODEL, show_default=True,
+              help="Claude model for subagents — the planner passes it "
+                   "on every Task call it makes.")
 @click.option("--skip", multiple=True,
               type=click.Choice(["discover", "extract", "organize", "audit",
                                  "relate", "reconcile"]),
               help="Skip one or more stages. Pass multiple times to skip several.")
 def expand_cmd(node: str, planner_model: str, subagent_model: str,
                skip: tuple[str, ...]):
-    """Run the full pipeline against an upstream node as a fresh target."""
+    """Run discover → reconcile against an upstream node as a fresh
+    target, within the current storage.
+
+    Expansion deliberately stops at reconcile: run `modsleuth run
+    merge` afterwards to fold the new edges into the graph (and
+    `modsleuth run triage` to re-gate further expansion). The
+    recursive driver batches several expands per round and does both
+    once per round.
+    """
     emit_json(run_expand(
         node=node,
         planner_model=planner_model,
@@ -270,17 +527,29 @@ def expand_cmd(node: str, planner_model: str, subagent_model: str,
                    "across depths by cumulative score).")
 @click.option("--storage-root", "storage_root", default=None,
               help="Root directory for per-seed MODSLEUTH_STORAGE dirs. "
-                   "Defaults to <repo>/storage.")
+                   "Defaults to ./storage under the current directory.")
+@click.option("--triage-gate/--no-triage-gate", default=True, show_default=True,
+              help="Expand only nodes the triage queue marks auto_expand "
+                   "(decline/manual nodes never consume expansion budget).")
+@click.option("--planner-model", default=None,
+              help="Claude model for every stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID. "
+                   "Default: each stage's own default.")
+@click.option("--subagent-model", default=None,
+              help="Claude model the planners pass on every Task call.")
 def recursive_cmd(seeds: tuple[str, ...], depth: int, top_k: int,
-                  strategy: str, storage_root: str | None):
-    """Reference recursive-expansion driver (paper §3.2 / §A).
+                  strategy: str, storage_root: str | None, triage_gate: bool,
+                  planner_model: str | None, subagent_model: str | None):
+    """Reference recursive-expansion driver.
 
     Multi-hop driver. For each seed, runs the base pipeline, then
     iteratively expands newly-discovered upstream artifacts up to
     ``--depth`` hops using the selected ``--strategy`` (BFS / DFS /
-    beam). Each seed gets its own MODSLEUTH_STORAGE directory; merge
-    across seeds afterwards by passing all per-seed merge_artifact.json
-    files to ``modsleuth run merge``.
+    beam). Each round refreshes the triage queue and, by default,
+    expands only ``auto_expand`` nodes. Each seed gets its own
+    MODSLEUTH_STORAGE directory; merge across seeds afterwards by
+    passing all per-seed merge_artifact.json files to
+    ``modsleuth run merge``.
     """
     from .recursive import main as recursive_main
     argv = []
@@ -288,8 +557,14 @@ def recursive_cmd(seeds: tuple[str, ...], depth: int, top_k: int,
         argv += ["--seed", s]
     argv += ["--depth", str(depth), "--top-k", str(top_k),
              "--strategy", strategy]
+    if not triage_gate:
+        argv += ["--no-triage-gate"]
     if storage_root:
         argv += ["--storage-root", storage_root]
+    if planner_model:
+        argv += ["--planner-model", planner_model]
+    if subagent_model:
+        argv += ["--subagent-model", subagent_model]
     raise SystemExit(recursive_main(argv))
 
 
@@ -302,9 +577,16 @@ def recursive_cmd(seeds: tuple[str, ...], depth: int, top_k: int,
               help="Comma-separated stages. Available: heuristic, hub-audit, node-dedup, release. "
                    "`all` runs them in order.")
 @click.option("--log", "log_path", default=None,
-              help="Optional log file path. Defaults to stderr only.")
-def dedup_cmd(source: str, dest: str, stages: str, log_path: str | None):
-    """Post-merge dedup pipeline (paper §3.2 Reconcile / cleanup).
+              help="Log file path (default: <dest>.log; appended, never truncated).")
+@click.option("--protect", multiple=True,
+              help="Substring that must survive every stage (repeatable; "
+                   "typically the run's seed identifiers).")
+@click.option("--model", default=None,
+              help="LLM for the hub-audit / node-dedup / release stages "
+                   "(default: Opus; also via MODSLEUTH_DEDUP_MODEL).")
+def dedup_cmd(source: str, dest: str, stages: str, log_path: str | None,
+              protect: tuple[str, ...], model: str | None):
+    """Post-merge dedup pipeline.
 
     Four stages over a merged JSON graph: heuristic clustering (no LLM),
     LLM hub-audit, LLM-verified node-dedup with conflict-guarded union-find,
@@ -312,34 +594,25 @@ def dedup_cmd(source: str, dest: str, stages: str, log_path: str | None):
     intermediate checkpoints. See modsleuth/dedup/__main__.py for details.
     """
     from .dedup.__main__ import run_dedup
-    raise SystemExit(run_dedup(source, dest, stages, log_path))
+    raise SystemExit(run_dedup(source, dest, stages, log_path,
+                               protect=protect, model=model))
 
 
-@main.command("viz-export")
+@main.command("check")
 @click.option("--source", "source_path", required=True,
-              help="Path to a merged or cleaned graph JSON.")
-@click.option("--out", "out_dir", default="docs", show_default=True,
-              help="Output directory. GitHub Pages typically serves from /docs/.")
-@click.option("--depth", type=int, default=3, show_default=True,
-              help="Hops to expand from each target seed.")
-@click.option("--target-size", type=int, default=60, show_default=True,
-              help="Approximate node budget per target (pre main-component prune).")
-def viz_export_cmd(source_path: str, out_dir: str, depth: int, target_size: int):
-    """Build a static, deployable viz with one tab per paper target.
+              help="Path to a merged graph JSON (merge artifact).")
+@click.option("--max-samples", type=int, default=3, show_default=True,
+              help="Examples shown per finding.")
+def check_cmd(source_path: str, max_samples: int):
+    """Deterministic graph-quality checks for a merged artifact.
 
-    Generates ``<out>/index.html`` plus ``<out>/data/<slug>.json`` for each of
-    the four paper targets (OLMo 3, Nemotron 3 Super, DR-Tulu, SmolLM3). The
-    HTML reuses the live viz UI verbatim; a target-tab strip switches between
-    the four prebuilt subgraphs via ``?t=<slug>``.
+    Pure-Python invariant checks (zero-anchor edges, dependency_kind
+    contradictions, self-loops, duplicate triples, unresolved subjects,
+    flattened lattices, evaluation-edge inflation). Exit code 1 when
+    any blocker-grade finding exists — usable as a stage gate.
     """
-    from .export_viz import export_static
-    result = export_static(
-        source=Path(source_path),
-        out_dir=Path(out_dir),
-        depth=depth,
-        target_size=target_size,
-    )
-    emit_json(result)
+    from .check import run_checks
+    raise SystemExit(run_checks(Path(source_path), max_samples=max_samples))
 
 
 @main.command("viz")
@@ -392,6 +665,59 @@ def debug_names(limit: int | None, kind: str | None):
     if limit:
         sql += f" LIMIT {int(limit)}"
     emit_json({"names": all_rows(sql, params)})
+
+
+@debug.command("conflicts")
+@click.option("--limit", type=int, default=50, show_default=True,
+              help="Max entries listed per category.")
+def debug_conflicts(limit: int):
+    """List flagged conflicts and provenance-review edges.
+
+    Reads the latest reconcile and merge artifacts: every conflict the
+    pipeline flagged for review (sibling-object disagreements,
+    description / dependency_kind variants, identity-value clashes)
+    plus every edge carrying `provenance_review: true` — the queue the
+    flag-for-review policy expects someone to work through.
+    """
+    def latest_artifact(stage: str) -> dict | None:
+        rows = all_rows(
+            "SELECT attrs FROM runs WHERE stage=? AND ended_at IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 5", (stage,))
+        for row in rows:
+            attrs = loads(row["attrs"], default={}) or {}
+            path = attrs.get("artifact_path")
+            if path and Path(path).exists():
+                return read_json(path)
+        return None
+
+    out: dict = {}
+    for stage in ("reconcile", "merge"):
+        art = latest_artifact(stage)
+        if art is None:
+            continue
+        conflicts = [c for c in (art.get("conflicts") or []) if isinstance(c, dict)]
+        by_kind: dict[str, int] = {}
+        for c in conflicts:
+            kind = str(c.get("kind") or "sibling_object")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        flagged = [
+            {"subject": e.get("subject"), "relation": e.get("relation"),
+             "object": e.get("object"),
+             "traced_targets": e.get("traced_targets") or []}
+            for e in (art.get("relations") or art.get("edges") or [])
+            if isinstance(e, dict) and e.get("provenance_review")
+        ]
+        out[stage] = {
+            "conflict_count": len(conflicts),
+            "conflicts_by_kind": by_kind,
+            "conflicts": conflicts[:limit],
+            "provenance_review_count": len(flagged),
+            "provenance_review": flagged[:limit],
+        }
+    if not out:
+        raise click.ClickException(
+            "no reconcile or merge artifacts found; run the pipeline first")
+    emit_json(out)
 
 
 @debug.command("names-packet")

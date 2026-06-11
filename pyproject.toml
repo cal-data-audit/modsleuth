@@ -1,0 +1,35 @@
+[project]
+name = "modsleuth"
+version = "1.0.0"
+description = "Reconstructing recursive, evidence-grounded dependency graphs of LLM releases from public artifacts"
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1",
+  "python-dotenv>=1.0",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+]
+
+[project.scripts]
+modsleuth = "modsleuth.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["modsleuth", "modsleuth.dedup"]
+
+[tool.setuptools.package-data]
+modsleuth = ["prompts/*.md"]
+
+[tool.setuptools.data-files]
+"share/modsleuth" = ["schema.sql"]
+"share/modsleuth/prompts" = [
+  "modsleuth/prompts/discover.md",
+  "modsleuth/prompts/extract.md",
+  "modsleuth/prompts/organize.md",
+  "modsleuth/prompts/audit.md",
+  "modsleuth/prompts/relate.md",
+  "modsleuth/prompts/triage.md",
+]

@@ -2,9 +2,11 @@
 
 > **Goal: read the lattice + relations, classify every
 > upstream entity-leaf as `auto_expand`, `decline`, or
-> `manual`.** The output is a queue the operator works
-> through with `modsleuth run expand --node <formal_name>`. We do
-> not auto-recurse — depth is operator-gated.
+> `manual`.** The output gates expansion two ways: the operator
+> works the queue with `modsleuth run expand --node <formal_name>`,
+> and the recursive driver (`modsleuth recursive`) expands
+> `auto_expand` nodes automatically each round (depth and beam
+> bounded by its flags). Your classification IS the gate.
 
 Read `{{lattice_path}}` and `{{relations_path}}`. Write the
 classification artifact to `{{artifact_path}}`.
@@ -48,9 +50,10 @@ chase.** Recursion is what produces the lineage findings that
 single-hop extract can't see — chains of distillation,
 multi-stage data mixing, judges-of-judges, OCR / rewriter
 models whose training corpora propagate through. Bias toward
-expanding; the operator still gates actual depth via
-`modsleuth run expand --node`, so this bucket is a recommendation
-queue, not an auto-trigger.
+expanding when the documentation bar below is met — but note
+that in recursive runs this bucket is executed automatically,
+so `auto_expand` is a commitment to spend an expansion run,
+not a suggestion for a human to filter.
 
 The single gate: the node must have **documented composition
 the next pass can extract from.** Bar is high by default —

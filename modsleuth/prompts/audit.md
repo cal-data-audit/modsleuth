@@ -113,7 +113,9 @@ restores drops, never renames anything. It does two things:
      anchors. Dataset-config / subset-of relationship (e.g.,
      `HuggingFaceTB/finemath` ⊃ `infimm-webmath/infiwebmath-3+`).
      Both stay as entities; ensure both descriptions note the
-     relationship so relate can emit a `subset_of` edge.
+     relationship so relate can land mentions at the right
+     granularity (subset relationships are never edges — they
+     live in descriptions and the parent's `subsets[]`).
    - `same_url_cross_family` — same primary URL appears in items
      from DIFFERENT families. **Prescriptive: pick the family
      whose name matches the URL's namespace owner** (e.g.,
@@ -250,6 +252,14 @@ to find.
   the lattice can't tell them apart. Either they're the same
   artifact (merge) or they need a discriminating facet
   (extend `identity_keys`).
+
+- **Are identity keys consistent across families?** If different
+  families express the same dimension under different key names
+  (`domain` vs `task` vs `mix`), rename to one key everywhere.
+  Prefer the canonical keys — `family`, `size`, `stage`, `date`,
+  `version`, `variant`, `quantization`, `org` — before keeping any
+  coined one; downstream identity comparison treats key names
+  literally, so synonym keys fragment the lattice.
 
 - **Do `formal_name`s match the artifact's canonical anchor?**
   After verifying the URL is real, check that the formal_name

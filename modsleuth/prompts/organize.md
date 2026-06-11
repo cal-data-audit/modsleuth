@@ -251,9 +251,20 @@ one. Common disambiguating facets:
 - `quantization` — FP8 / AWQ / GPTQ
 - `date` — API snapshot date
 
+**Reuse canonical key names.** When the dimension fits one of
+`family`, `size`, `stage`, `date`, `version`, `variant`,
+`quantization`, `org`, use that exact key. Coin a new key only
+when none of them fits — and never coin a synonym for a key you
+(or another family in this artifact) already use: `domain`,
+`task`, `mix`, and `rl_skill` describing the same dimension under
+four names fragments the lattice, because downstream identity
+comparison treats key names literally. Pick one key per dimension
+and reuse it across every family.
+
 Don't force one schema across unrelated families. A family of
 benchmark variants will look nothing like a family of model
-checkpoints.
+checkpoints — but where two families *do* share a dimension, they
+must share its key name.
 
 ## Resolution: find the canonical anchor
 

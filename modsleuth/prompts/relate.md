@@ -136,8 +136,7 @@ no flag needed on the edge.
   if the global-policy-edges rule applies).
 - **Objects** can be Models, Datasets, family roots, concept
   nodes, or free-text. Cannot be tokenizers / frameworks /
-  software libraries / codebases (per §2 — those aren't node
-  types).
+  software libraries / codebases — those aren't node types.
 
 If a source describes an action whose natural English subject
 is a dataset (e.g., "olmOCR transformed PDFs into Dolma"),
@@ -171,6 +170,29 @@ Same fact at multiple subjects is exactly what the schema
 expects — graph-level joinability comes from the consumer-as-
 subject framing.
 
+## Subject locality — sources are official only for the tracing target
+
+The tracing target for this batch is: **{{traced_target}}**.
+
+This batch holds the tracing target's own official materials. They
+are authoritative for the target's release family (its sizes, stages,
+and sibling models) and for other artifacts released by the same
+organization — and for nothing else. A claim about some OTHER
+organization's model found here is third-party evidence for that
+model, and an edge built on it cannot be verified against the
+subject's own documentation.
+
+- Emit edges whose subject is the tracing target, a member of its
+  release family, or another model from the same organization whose
+  pipeline this batch's sources document first-hand.
+- If a source here claims that a foreign organization's model used or
+  trained on an artifact (e.g., a dataset card noting "X also trains
+  on us" where X is unrelated to the target), do NOT emit that edge
+  from this run. The claim belongs to X's own tracing run, where X's
+  official materials can back it first-hand.
+- The global-policy fan-out rule below stays within the tracing
+  target's release family; it never licenses foreign-org subjects.
+
 ## Aggregator + leaf rule (load-bearing)
 
 When `subject --trained_on--> aggregator` and the aggregator
@@ -194,9 +216,9 @@ Pick the form that matches the lattice item if one exists; else
 synthesize `<aggregator-formal-name>/<slug>` so the verifier
 sees the explicit composition.
 
-Per investigator §AGGREGATOR: **leaf edges look redundant with
-the aggregator edge but they capture the dependency at the
-granularity reference graphs use. Do NOT drop them.**
+**Leaf edges look redundant with the aggregator edge but they
+capture the dependency at the granularity reference graphs use.
+Do NOT drop them.**
 
 If the source says only some sub-corpora were used (e.g.,
 "Olmo-3-7B-Base used CraneMath and FineMath4+ but not the
@@ -247,10 +269,13 @@ snake_case label when the source describes an event that none
 of the canonical values capture, AND the object is a valid
 node (model or dataset). Examples of legitimate coining:
 `merged_from` (model souping — object is a Model),
-`embedded_by` (object is an embedding Model). Do NOT coin
+`embedded_by` (object is an embedding Model). Five recurrent
+coined labels have fixed kinds — `merged_from`,
+`quantized_from`, `embedded_by`, `decontaminated_against`, and
+`composed_from` are all `direct`. Do NOT coin
 relation labels whose object would be a tokenizer / dedup tool /
 decontamination tool / framework — those targets aren't valid
-nodes per §2.
+nodes.
 
 **Do NOT coin** when the canonical label fits. The planner
 that emits `cited_as_baseline` instead of skipping the edge
@@ -298,7 +323,7 @@ new label means without re-reading the source.
   infrastructure** (PyTorch, vLLM, Transformers, datatrove,
   tiktoken, ray, OLMo-core the codebase, Resiliparse the
   library, Duplodocus the dedup tool, `allenai/dolma3-tokenizer`
-  the BPE vocab). NOT NODES per investigator §2. They are
+  the BPE vocab). NOT NODES. They are
   software / libraries / vocab files, not models or datasets.
   Skip entirely. Don't emit an edge to them, don't emit them as
   nodes. Only `model` and `dataset` are valid node types.
@@ -416,7 +441,7 @@ both.
 - `object`: same shape as subject (leaf / root / concept) for
   model or dataset objects, OR a free-text descriptor when no
   family pivot exists. Cannot be a tokenizer / framework /
-  software / codebase per §2.
+  software / codebase.
 - `description`: lossless prose. MUST capture every
   structurally relevant fact that the relation, subject,
   object, and event description don't already express:
@@ -438,11 +463,11 @@ both.
     figures, or non-quotable content, set `position` precisely
     and leave `excerpt` empty (acceptable in those cases).
 
-  Edges with `excerpt` + `position` populated receive
-  `cited_evidence_supports` from the verifier. Missing them
-  forces a fallback to `external_support_only` (the verifier
-  re-derives support from elsewhere, which under-grounds the
-  claim).
+  Verification reads the cited evidence and checks excerpts /
+  locations when present; an edge without them can only be
+  corroborated by independent search, which under-grounds the
+  claim. Populate `excerpt` + `position` whenever the source
+  allows.
 
 ## Event schema (one JSONL line)
 

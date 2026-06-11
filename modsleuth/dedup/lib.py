@@ -18,6 +18,7 @@ This module factors out the helpers used in more than one stage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -30,8 +31,15 @@ from typing import Any, Callable, Iterable
 # ============================================================
 # Defaults
 # ============================================================
-MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_WORKERS = 24
+
+
+def dedup_model() -> str:
+    """Model for the LLM dedup stages (hub-audit, node-dedup, release).
+    Resolved at call time so `modsleuth dedup --model` and the
+    MODSLEUTH_DEDUP_MODEL env var both take effect."""
+    return os.environ.get("MODSLEUTH_DEDUP_MODEL", DEFAULT_MODEL)
 
 # ============================================================
 # Regex helpers (single source of truth)
@@ -65,7 +73,10 @@ def load_graph(path: Path) -> dict:
 
 
 def save_graph(graph: dict, path: Path) -> None:
-    path.write_text(json.dumps(graph))
+    """Atomic write — a crash mid-write must never corrupt an existing graph."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(graph))
+    os.replace(tmp, path)
 
 
 def collect_node_names(graph: dict) -> set[str]:
@@ -360,20 +371,37 @@ def rewrite_edges(
                 "description_variants": list(e.get("description_variants") or []),
             }
         else:
-            anchors = new_edges[key]["anchor_list"]
+            target = new_edges[key]
+            anchors = target["anchor_list"]
             anchors.extend(e.get("anchor_list") or [])
             if cap_anchors:
-                new_edges[key]["anchor_list"] = anchors[:cap_anchors]
+                target["anchor_list"] = anchors[:cap_anchors]
             for v in e.get("description_variants") or []:
-                if v not in new_edges[key]["description_variants"]:
-                    new_edges[key]["description_variants"].append(v)
+                if v not in target["description_variants"]:
+                    target["description_variants"].append(v)
+            for oid in e.get("operation_ids") or []:
+                if oid not in target.setdefault("operation_ids", []):
+                    target["operation_ids"].append(oid)
+            for tt in e.get("traced_targets") or []:
+                if tt not in target.setdefault("traced_targets", []):
+                    target["traced_targets"].append(tt)
+            if e.get("provenance_review"):
+                target["provenance_review"] = True
     return list(new_edges.values()), dropped_endpoint, dropped_self
 
 
 def rebuild_lattice(
     groups: list[dict], canon_map: dict[str, str], final_node_set: set[str]
 ) -> list[dict]:
-    """Rebuild lattice groups by collapsing items into their canonical nodes."""
+    """Rebuild lattice groups by collapsing items into their canonical nodes.
+
+    Output keeps the standard lattice shape — one group per family,
+    ``{family, identity_keys, items}`` — so a deduped artifact stays
+    schema-compatible with ``run merge`` and downstream tooling instead
+    of degenerating into singleton groups. Absorbed items contribute
+    their formal_name and aliases to the canonical item's alias list so
+    surface variants remain resolvable.
+    """
     canon_to_items: dict[str, list[dict]] = defaultdict(list)
     for g in groups:
         for it in g.get("items", []):
@@ -383,47 +411,52 @@ def rebuild_lattice(
             canon = canon_map.get(fn, fn)
             if canon and canon in final_node_set:
                 canon_to_items[canon].append(it)
-    out: list[dict] = []
+
+    by_family: dict[str, dict] = {}
     for canon, items in canon_to_items.items():
         primary = next((i for i in items if i.get("formal_name") == canon), items[0])
         primary = dict(primary)
+        aliases = list(primary.get("aliases") or [])
+        for it in items:
+            for alias in [it.get("formal_name"), *(it.get("aliases") or [])]:
+                if alias and alias != canon and alias not in aliases:
+                    aliases.append(alias)
         primary["formal_name"] = canon
+        primary["aliases"] = aliases
         primary["alias_count"] = len(items)
-        out.append({"items": [primary], "id": canon})
-    return out
+
+        family = str((primary.get("identity") or {}).get("family") or canon)
+        entry = by_family.setdefault(family, {
+            "family": family,
+            "identity_keys": ["family"],
+            "items": [],
+        })
+        for key in (primary.get("identity") or {}):
+            if key not in entry["identity_keys"]:
+                entry["identity_keys"].append(key)
+        entry["items"].append(primary)
+    return list(by_family.values())
 
 
 # ============================================================
 # Sanity invariants (run before every write)
 # ============================================================
-SEED_PREFIXES = (
-    "allenai/Olmo-3",
-    "rl-research/DR-Tulu",
-    "rl-research/dr-tulu",
-    "nvidia/NVIDIA-Nemotron-3",
-    "HuggingFaceTB/SmolLM3",
-)
 
 
-def assert_invariants(node_set: set[str]) -> None:
-    """Each invariant caught at least one regression during development."""
-    olmo3 = [n for n in node_set if "olmo-3-" in n.lower().replace(" ", "-") and "3.1" not in n.lower()]
-    olmo31 = [n for n in node_set if "olmo-3.1" in n.lower()]
-    assert olmo3, "Olmo-3 nodes empty"
-    assert olmo31, "Olmo-3.1 nodes empty (version distinction collapsed)"
+def assert_invariants(node_set: set[str], protected: tuple[str, ...] = ()) -> None:
+    """Sanity checks run before every write.
 
-    for prefix in SEED_PREFIXES[:1] + SEED_PREFIXES[3:]:  # only canonical seeds
-        if not any(prefix in n for n in node_set):
-            # DR-Tulu has multiple casing variants; check that one of them is present.
-            if prefix == "allenai/Olmo-3":
-                continue
-        assert any(prefix in n for n in node_set), f"Seed prefix '{prefix}' missing"
-    assert any("rl-research/" in n.lower() and "tulu" in n.lower() for n in node_set), "DR-Tulu missing"
-
-    aime_2024 = any("aime" in n.lower() and "2024" in n for n in node_set)
-    aime_2025 = any("aime" in n.lower() and "2025" in n for n in node_set)
-    assert aime_2024, "AIME 2024 missing"
-    assert aime_2025, "AIME 2025 missing"
+    ``protected`` is an optional set of substrings (typically the run's
+    seed identifiers) that must survive every dedup stage — a guard
+    against a stage accidentally collapsing or dropping a seed node.
+    Matching is case-insensitive substring containment.
+    """
+    assert node_set, "node set is empty after dedup stage"
+    for needle in protected:
+        nl = needle.lower()
+        assert any(nl in n.lower() for n in node_set), (
+            f"protected node '{needle}' missing from graph after dedup stage"
+        )
 
 
 # ============================================================
@@ -434,9 +467,11 @@ def call_opus(
     *,
     effort: str = "max",
     timeout: int = 600,
-    model: str = MODEL,
+    model: str | None = None,
 ) -> tuple[str, int]:
-    """Run a single Opus call via the `claude` CLI. Returns (stdout, returncode)."""
+    """Run a single LLM call via the `claude` CLI. Returns (stdout,
+    returncode). `model` defaults to `dedup_model()`."""
+    model = model or dedup_model()
     try:
         result = subprocess.run(
             [
@@ -503,7 +538,10 @@ class StageLogger:
         self._lock = Lock()
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_text("")
+            # Append, never truncate: a rerun must not erase the previous
+            # run's decision trail.
+            with open(log_path, "a") as f:
+                f.write(f"\n{'=' * 70}\n# dedup run {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     def log(self, msg: str) -> None:
         if self.log_path:

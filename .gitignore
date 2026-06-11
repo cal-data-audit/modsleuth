@@ -23,3 +23,13 @@ run-logs/
 *.swp
 .idea/
 .vscode/
+
+# --- not shipped: graph artifacts ---
+data/
+
+*.bak
+*.after-*.json
+*.log
+*.tmp
+build/
+*.egg-info/

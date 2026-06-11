@@ -7,17 +7,54 @@ cards, code repositories, release blogs).
 This repository accompanies *"Which Models Are
 Our Models Built On? Auditing Invisible Dependencies in Modern LLMs"*.
 
-The pipeline depends on the `claude` CLI being available in `PATH`
-(used by every Claude planner / subagent). Set `ANTHROPIC_API_KEY`
-before running.
+**Demo:** https://modsleuth.cal-data-audit.org
+
+This repository ships the ModSleuth **software only** — no graph
+artifacts are included. The dependency graphs recovered in the paper
+(2,526 nodes, 9,112 evidence-grounded edges across Olmo 3, Nemotron 3
+Super, DR Tulu, and SmolLM3) are browsable and downloadable from the
+demo above; any `merge_artifact.json` you produce with the pipeline
+can be browsed with the built-in viewer (`modsleuth viz`).
+
+## Runtimes and authentication
+
+Every stage runs through the `claude` CLI (Claude Code), which must be
+on `PATH`. Either setup works:
+
+- **Claude subscription** — install the `claude` CLI and complete its
+  login flow once. No API key needed; the pipeline inherits the CLI's
+  own session.
+- **Anthropic API** — set `ANTHROPIC_API_KEY` and the `claude` CLI
+  bills through the API instead of a subscription.
+
+Model names are free-form. `--planner-model` and `--subagent-model`
+accept an alias (`opus`, `sonnet`, `haiku`) or a full model ID
+(`claude-opus-4-7`, …); the default comes from `MODSLEUTH_CLAUDE_MODEL`
+(default `opus`). Subagent steering is prompt-level: the planner is
+instructed to pass the chosen model on every Task call it makes. The
+dedup stages default to Opus — override with `modsleuth dedup --model`
+or `MODSLEUTH_DEDUP_MODEL`.
+
+Optionally set `HF_TOKEN` (a Hugging Face read token). Unauthenticated
+HF traffic is rate-limited at roughly 30 requests/min, which a
+full-scale run exceeds quickly; with a token, the discover / organize /
+audit stages and the deterministic subset-metadata pass authenticate
+every `huggingface.co` call, raising the ceiling ~30× and resolving
+gated repos the token has access to.
+
+## Install
+
+```bash
+pip install -e .
+modsleuth --help
+```
 
 ## Quick start
 
-A full target-model run goes through three layers (Figure 2 in
-the paper):
+A full target-model run goes through three layers:
 
 ```bash
-# 1. Base pipeline (Stages 1–5 of paper §3.2): single-target, depth-1.
+# 1. Base pipeline: single-target, depth-1.
 modsleuth init
 modsleuth run discover --target HuggingFaceTB/SmolLM3-3B   # Gather
 modsleuth run extract                                       # Extract
@@ -29,38 +66,41 @@ modsleuth run triage                                        #   ↳ flag for exp
 modsleuth run merge                                         # combine per-batch
 # → writes storage/runs/<id>/merge_artifact.json
 
-# 2. Recursive expansion (paper §3.2 / §A): multi-hop, top-K BFS.
+# 2. Recursive expansion: multi-hop, top-K BFS.
 modsleuth recursive --seed HuggingFaceTB/SmolLM3-3B --depth 3 --top-k 5
 
-# 3. Post-merge cleanup (§D / appendix).
+# 3. Post-merge cleanup.
 modsleuth dedup \
     --source storage/runs/<id>/merge_artifact.json \
     --dest   storage/runs/<id>/graph.json \
     --stages all
 
-# 4. Browse the cleaned graph.
+# 4. Gate on graph quality (deterministic invariant checks).
+modsleuth check --source storage/runs/<id>/graph.json
+
+# 5. Browse the cleaned graph.
 modsleuth viz --source storage/runs/<id>/graph.json --port 8102
 # open http://127.0.0.1:8102/
 ```
 
-Storage paths are controlled by `MODSLEUTH_STORAGE` (state and
-artifacts) and `MODSLEUTH_PATH` (SQLite database).
+Storage defaults to `./storage` under the directory you run from;
+override with `MODSLEUTH_STORAGE` (state and artifacts) and
+`MODSLEUTH_PATH` (SQLite database).
 
 ## The base pipeline
 
 The base pipeline runs eight stages over the artifacts of a single
-target release. Each stage maps to a stage in the paper's five-stage
-figure (Figure 2):
+target release:
 
-| Stage | Paper (§3.2) | Runtime | Job |
+| Stage | Phase | Runtime | Job |
 |---|---|---|---|
 | `discover` | **Gather** | Claude planner | Fetch the target's official artifacts (paper, model and dataset cards, repo, release blog) into topical batches |
-| `extract` | **Extract** | Claude planner per batch (parallel) | Per source: surface every model/dataset mention with kind, atoms, inline links, and source-side anchors |
-| `organize` | **Resolve** (build) | Python | Dedup mentions into clusters; detect identity conflicts; build the identity lattice |
-| `audit` | **Resolve** (revise) | Claude planner → fans out subagents | Per cluster: identity, aliases, concept_path, confirmed link, conflict resolution. A pure-Python pre-pass in `modsleuth.subsets` populates HF subset / parent metadata before the LLM step. |
+| `extract` | **Extract** | Claude planner per batch (parallel) | Per batch: list every model/dataset mention exactly as the source writes it (verbatim `type` + `name` records; surface variants are kept distinct) |
+| `organize` | **Resolve** (build) | Claude planner | Cluster surface variants by family, classify each name as entity or concept, resolve canonical URLs, and build the identity lattice |
+| `audit` | **Resolve** (revise) | Claude planner | Whole-lattice review: resolve identity collisions, fix canonical links, restore wrongly dropped names, complete descriptions. A pure-Python pre-pass in `modsleuth.subsets` populates HF subset / parent metadata and emits audit hints before the LLM step. |
 | `relate` | **Relate** | Claude planner per batch | Extract operation-level dependency claims (operations + edges + anchors) against the resolved lattice |
-| `reconcile` | **Reconcile** (refinement / consolidation / conflict-detection) | Python | Merge overlapping claims into the lattice; surface conflicts |
-| `triage` | **Reconcile** (audit step) | Python | Flag candidate ghosts and upstream-node expansion candidates for further review |
+| `reconcile` | **Reconcile** (refinement / consolidation / conflict-detection) | Python | Merge overlapping claims into the lattice; surface conflicts and evidence-provenance flags |
+| `triage` | **Reconcile** (audit step) | Claude planner | Classify every upstream entity-leaf as `auto_expand` / `decline` / `manual`, queueing candidates for recursive expansion |
 | `merge` | (cross-batch / cross-run) | Python | Merge per-batch and per-seed artifacts into a single graph JSON |
 
 The CLI lives at `modsleuth/cli.py`; stage implementations are in
@@ -68,6 +108,17 @@ The CLI lives at `modsleuth/cli.py`; stage implementations are in
 are markdown files in `modsleuth/prompts/`.
 
 ### Inspecting state mid-run
+
+`modsleuth status` prints a per-stage progress snapshot: when each
+stage last completed, batch progress with mention / edge totals,
+conflict and provenance-flag counts, and the suggested next command.
+
+Long-running stages also stream progress to stderr while they work —
+planner start / heartbeat / done lines, per-batch completions, and
+rate-limit retry notices — so a multi-hour run is never silent. Re-runs
+of `extract` and `relate` skip batches that already completed, so
+retrying after a partial failure costs only the failed batches
+(`--force` redoes everything).
 
 The `debug` subcommands surface intermediate artifacts:
 
@@ -85,12 +136,11 @@ modsleuth debug merge              # cross-run merged graph
 ## Recursive expansion
 
 The base pipeline produces only the immediate (one-hop) dependencies of
-a single target. The paper's recursive-tracing claim (Figure 1, §3.2,
-§4) requires expanding upstream artifacts as fresh targets and re-merging.
+a single target. Recursive tracing requires expanding upstream artifacts
+as fresh targets and re-merging.
 
-`modsleuth recursive` implements the three strategies described in
-paper §A — breadth-first (BFS, the default), depth-first (DFS), and
-beam search:
+`modsleuth recursive` implements three expansion strategies —
+breadth-first (BFS, the default), depth-first (DFS), and beam search:
 
 ```bash
 modsleuth recursive \
@@ -119,6 +169,14 @@ reflects the latest discoveries. Per-node expansion uses the existing
 `reconcile` against the named upstream artifact within the same
 storage.
 
+Each round also refreshes `triage` and, by default, expands only nodes
+its queue marks `auto_expand` — closed-data families and undocumented
+nodes never consume expansion budget (`--no-triage-gate` ranks
+ungated). Expansion scoring canonicalizes edge endpoints through the
+lattice (aliases, case variants, shared primary URLs), so one artifact
+never fragments its parent count across name variants or gets expanded
+twice under two spellings.
+
 The exact strategy used in the paper is target-specific (seed list,
 per-seed K, optional pre-seeded high-betweenness bridge artifacts so
 seeds share an upstream backbone). Adjust `--seed`, `--top-k`,
@@ -141,18 +199,28 @@ Four stages run over the merged JSON graph. Each can be invoked alone:
 | Stage | Mechanism | What it does |
 |---|---|---|
 | `heuristic` | no LLM | Signature-based clustering with hard separators on org × bare_norm × versions × sizes × stages × dates × parens × bracket attrs. Folds bare names into the highest-degree compatible prefixed cluster. Drops internal paths and free-text descriptive nodes. Filters low-signal concept names with degree < 3. |
-| `hub-audit` | Opus 4.7 + max thinking | For each top out-hub and in-hub, asks the LLM to drop edges that are duplicates, hallucinations, vacuous concepts, or wrong-relation. Tagged drop categories. |
-| `node-dedup` | Opus 4.7 + max thinking | Builds candidate dedup clusters across the whole graph from five high-precision signals (lex-collapse, token-Jaccard ≥ 0.6, substring containment, cross-org bare-lex match, suffix stripping). Verifies each cluster with the LLM. Applies decisions via a conflict-guarded union-find that refuses to merge components with mutually conflicting versions / sizes / stages / dates. |
-| `release` | Opus 4.7 + high effort | Classifies every node as KEEP (officially released artifact / standard benchmark) or DROP (intermediate research checkpoint, internal training-data variant, prose alias). For each dropped node, transitively rewires `A → DROP → B` chains along compatible relation pairs (`trained_from`+`trained_from`, `trained_on`+`trained_on`, etc.) so released-to-released ancestry stays connected. |
+| `hub-audit` | dedup LLM (default Opus) + max thinking | For each top out-hub and in-hub, asks the LLM to drop edges that are duplicates, hallucinations, vacuous concepts, or wrong-relation. Tagged drop categories. |
+| `node-dedup` | dedup LLM (default Opus) + max thinking | Builds candidate dedup clusters across the whole graph from five high-precision signals (lex-collapse, token-Jaccard ≥ 0.6, substring containment, cross-org bare-lex match, suffix stripping). Verifies each cluster with the LLM. Applies decisions via a conflict-guarded union-find that refuses to merge components with mutually conflicting versions / sizes / stages / dates. |
+| `release` | dedup LLM (default Opus) + high effort | Classifies every node as KEEP (officially released artifact / standard benchmark) or DROP (intermediate research checkpoint, internal training-data variant, prose alias). For each dropped node, transitively rewires `A → DROP → B` chains along compatible relation pairs (`trained_from`+`trained_from`, `trained_on`+`trained_on`, etc.) so released-to-released ancestry stays connected. |
 
-Each stage reads JSON, applies its operation, writes JSON. Sanity
-invariants (distinct version numbers, distinct year-stamped releases,
-all seed targets present, conflict-free dates / sizes / stages) are
-asserted before every write.
+Each stage reads JSON, applies its operation, writes JSON. After
+every stage a sanity check asserts the node set is non-empty and that
+every `--protect` substring (repeatable; typically the run's seed
+identifiers) still matches a surviving node — a guard against a stage
+collapsing or dropping a seed.
+
+Nothing is ever lost to a crash or a careless rerun: all writes are
+atomic; in a multi-stage run each stage's output is checkpointed to
+`<dest>.after-<stage>.json` so you can resume from the last completed
+stage; an existing `--dest` is preserved as `<dest>.bak` before being
+replaced; `--source` and `--dest` must differ; and every destructive
+decision (edge drops, node merges, node DROPs, with the LLM's reasons)
+is appended — never truncated — to the log (default `<dest>.log`).
 
 ```bash
 # Run all four stages end-to-end (default).
-modsleuth dedup --source merge.json --dest graph.json --stages all
+modsleuth dedup --source merge.json --dest graph.json --stages all \
+    --protect "allenai/OLMo-3" --protect "HuggingFaceTB/SmolLM3"
 
 # Or run a single stage.
 modsleuth dedup --source merge.json           --dest after_heuristic.json --stages heuristic
@@ -163,6 +231,30 @@ modsleuth dedup --source after_node.json      --dest graph.json           --stag
 
 The hub-audit and node-dedup stages take ~25 min each on a 15k-edge
 graph with 24 parallel `claude` workers; release-filter takes under 2 min.
+
+## Graph quality checks (`modsleuth check`)
+
+```bash
+modsleuth check --source path/to/graph.json
+```
+
+Deterministic, read-only invariant checks over any merged graph, each
+corresponding to a defect class observed while QA'ing real pipeline
+output. Blocker-grade (P1) findings: edges with empty `anchor_list`,
+`dependency_kind` labels contradicting their canonical relation,
+self-loops, duplicate `(subject, relation, object)` triples, subjects
+that resolve to neither a lattice item nor a virtual concept address,
+and fully flattened lattices (every group a singleton). Review-grade
+(P2) findings cover dataset-kind subjects on weight-lineage relations,
+families without roots, duplicate lattice items, and unparseable
+bracket-style names; P3 lines report distribution facts (relation
+histogram, evaluation-edge share, off-lattice object share, evidence
+provenance coverage).
+
+Exit code is 1 when any P1 finding exists, 0 otherwise — usable as a
+gate between pipeline stages or in CI. Nothing is mutated and nothing
+is judged semantically: findings route edges to review, they never
+auto-fix.
 
 ## Visualizer
 
@@ -215,190 +307,22 @@ Tunables:
 Combine multiple framings by re-running with different `--seed` values
 or different `--depth` / `--target-size` budgets.
 
-## Edge audit (sanity analyzer)
+## Baseline task prompts
 
-```bash
-python edge_audit.py --source path/to/graph.json
-```
+`baselines/` contains the single-prompt specification of the
+tracing task that the single-pass baseline systems received in the
+comparison reported in the paper. `baseline_prompt.md` is the shared
+template — it spells out the node / edge / anchor JSON contract, the
+relation vocabulary, and the scoping rules — and the four
+`baseline_prompt_<subject>.md` files are its per-target instantiations
+(OLMo 3, Nemotron 3 Super, DR-Tulu, SmolLM3). Any web-capable agent
+pointed at one of them produces a graph directly comparable to
+ModSleuth's output for that target.
 
-Static edge-pattern analyzer: top hubs, anchor-coverage distribution,
-near-duplicate object/subject names that survived dedup, weak-evidence
-claims, and (subject, object) pairs with multiple distinct relations.
-Useful as a quick sanity-check on any graph version.
-
-## Baselines and pooled evaluation (paper §3.3, §B, §C)
-
-`baselines/` and `eval/` contain everything needed to reproduce the
-comparative evaluation reported in Table 1 of the paper, and to evaluate
-any new submission against the same pool.
-
-### Systems
-
-Six systems are evaluated against the same four targets (OLMo 3,
-Nemotron 3 Super, DR-Tulu, SmolLM3). The four single-pass baselines get
-the same baseline prompt template (paper §C; full text at
-`baselines/prompts/baseline_prompt.md`); the two ModSleuth scopes are
-attribution variants of a single ModSleuth run (paper §B).
-
-| Slug | Paper label | Configuration |
-|---|---|---|
-| `gpt55pro` | GPT-5.5 Pro | OpenAI Responses API, `web_search_preview`, background mode |
-| `gpt54pro` | GPT-5.4 Pro | OpenAI Responses API, `web_search_preview`, background mode |
-| `o3dr` | ChatGPT Deep Research (`o3-deep-research`) | OpenAI Responses API, `web_search_preview`, background mode |
-| `cc` | CC-single (single-prompt Claude Code) | `claude -p` headless, Opus 4.7 1M context, default effort |
-| `prov` | ModSleuth (depth-1) | Subject canonical-form == target's canonical id |
-| `prov_unbounded` | ModSleuth (unbounded) | Depth-1 ∪ seed-tagged anchor ∪ uniquely-tied worker (§B) |
-
-The internal slug → paper label mapping is also encoded in
-`eval/pooled_eval.py:SLUG_TO_LABEL` and is what the rendered table
-prints.
-
-Reproduce the four baselines:
-
-```bash
-cd baselines
-OPENAI_API_KEY=sk-... python3 launch_baselines.py
-```
-
-Each (system, target) pair writes to `baselines/outputs/<slug>_<subject>.json`.
-The 16 baseline outputs and the 8 ModSleuth attribution outputs
-(`prov_<target>.json`, `prov_unbounded_<target>.json`) from the run
-reported in the paper are committed.
-
-### Building the ModSleuth attribution outputs
-
-The two ModSleuth rows in Table 1 are derived from a single merged
-graph (`merge_artifact.json`, the 14,769-edge ModSleuth artifact)
-under the two attribution scopes defined in paper §B. To rebuild
-`prov_<target>.json` and `prov_unbounded_<target>.json` from a fresh
-merge:
-
-```bash
-cd eval
-python3 build_modsleuth_inputs.py \
-    --merge-artifact path/to/merge_artifact.json \
-    --out-dir ../baselines/outputs
-```
-
-The script implements the §B rules verbatim:
-
-- **depth-1**: subject's canonical form (lowercased, non-alphanumeric
-  collapsed to `-`, HF org prefix preserved) exactly matches the
-  target's canonical identifier.
-- **unbounded**: depth-1 ∪ at least one anchor source path containing
-  `/seeds/<T's seed dir>/`, ∪ at least one anchor source path
-  containing `/workers/<w>/` where worker `w` co-occurs (across the
-  whole merge artifact) only with `T`'s seed directory.
-
-The merge artifact itself (`data/merge_artifact.json`, the 14,769-edge
-post-dedup ModSleuth graph) is shipped via **git-lfs** because it is
-too large for a regular git checkout (~86 MB). To fetch it after
-cloning:
-
-```bash
-git lfs install
-git lfs pull
-```
-
-The same file is also the input to `full_graph_audit.py` and to the
-`compute_graph_stats.py` reproducer for Tables 2/4/5.
-
-### Pooled evaluation
-
-`eval/pooled_eval.py` is the canonical pooled LLM-as-judge verifier
-described in paper §B. For each target, every emitted edge across all
-systems is pooled and clustered by canonicalized `(subject, object)`
-pair. Each cluster's representative claim (longest description) is sent
-to a single `claude-sonnet-4-6` verifier instance equipped with
-`web_search`, which returns one of `verified` / `refuted` / `unclear`.
-A single verifier verdict cleanly attributes back to every system that
-proposed an edge in that cluster, so per-system Verified / Refuted
-counts mean: how many clusters did this system contribute to, broken
-down by verdict.
-
-The verifier's system prompt is at `eval/verifier_prompt.md`.
-
-Reproduce:
-
-```bash
-cd eval
-ANTHROPIC_API_KEY=sk-ant-... python3 pooled_eval.py
-```
-
-The verdicts in `eval/outputs/verifications.jsonl` (and the aggregated
-`score.json` / `score_per_target.json`) are the exact records used in
-the paper. Verifications append incrementally and resume on kill.
-
-### Full-graph audit (Table 6, paper §D.2)
-
-Table 1 measures comparative recall across systems via cluster-level
-pooling. Table 6 measures *full-graph precision*: each of the 14,769
-relations in the merged ModSleuth graph is verified individually. The
-verdicts used in the paper are committed at
-`eval/outputs/full_graph_verifications.jsonl` (one verdict per line,
-14,769 lines) and aggregated in
-`eval/outputs/full_graph_verifications.score.json`. To re-run from
-scratch (≈14,769 fresh `claude-sonnet-4-6` + `web_search` calls):
-
-```bash
-cd eval
-ANTHROPIC_API_KEY=sk-ant-... python3 full_graph_audit.py \
-    --merge-artifact ../data/merge_artifact.json \
-    --out outputs/full_graph_verifications.jsonl
-```
-
-The script appends one verdict per line and resumes on kill. It uses
-the same verifier and system prompt (`verifier_prompt.md`) as
-`pooled_eval.py`. At completion it prints (and writes to
-`outputs/full_graph_verifications.score.json`) the totals reported in
-Table 6 — 14,110 verified, 424 refuted, 235 unclear, precision 0.9708.
-
-### Graph-level statistics (Tables 2 / 4 / 5, paper §4.1, §D.1)
-
-`eval/compute_graph_stats.py` is the exact script used to compute
-Tables 2, 4, and 5 in the paper:
-
-```bash
-python3 eval/compute_graph_stats.py \
-    --merge-artifact data/merge_artifact.json
-```
-
-Each row of every table reproduces exactly:
-
-* **Table 2** — edges grouped by audit role × dependency-kind, counted
-  from each relation's `relation` and `dependency_kind` fields.
-* **Table 4** — per-target ancestor counts and max depth via BFS over
-  the upstream-edge subset (every relation type *except*
-  `used_for_evaluation`), starting from a single canonical seed per
-  target (see `TABLE4_TARGETS`).
-* **Table 5** — source-type distribution using the classifier in
-  `classify_source()`: anchors with `huggingface.co` count as HF cards;
-  `arxiv.org` / `*.pdf` as PDFs; code/config/markdown extensions or
-  `github.com` paths as code (with `readme` → other docs and `/blog/`
-  → blog as exceptions); other blog patterns as blog; everything else
-  as other docs.
-
-### Adding a new submission
-
-If your submission follows the same per-target `{nodes, edges}` JSON
-convention as the baselines, drop your files into `baselines/outputs/`
-named `<slug>_<subject>.json`, then re-run `pooled_eval.py` with your
-slug appended:
-
-```bash
-cd eval
-ANTHROPIC_API_KEY=sk-ant-... python3 pooled_eval.py \
-    --systems gpt55pro,gpt54pro,cc,o3dr,mysystem
-```
-
-Only clusters your system contributes that aren't already covered get
-fresh verifier calls. Existing verdicts are preserved.
-
-## Tests
-
-```bash
-python -m pytest tests/ -q
-```
+The launch scripts and evaluation harness behind the paper's
+comparison are not part of this software release. The dependency
+graphs recovered in the paper are browsable and downloadable from the
+demo (https://modsleuth.cal-data-audit.org).
 
 ## Repository layout
 
@@ -406,9 +330,10 @@ python -m pytest tests/ -q
 .
 ├── modsleuth/                  # ModSleuth pipeline package
 │   ├── cli.py                  # `modsleuth` CLI entry point
+│   ├── check.py                # deterministic graph-quality checks
 │   ├── config.py               # storage / model / env defaults
 │   ├── pipeline.py             # all stage implementations
-│   ├── prompts/                # stage-level markdown prompts (paper §A)
+│   ├── prompts/                # stage-level markdown prompts
 │   │   ├── discover.md         #   Gather (Stage 1)
 │   │   ├── extract.md          #   Extract (Stage 2)
 │   │   ├── organize.md         #   Resolve build (Stage 3)
@@ -419,31 +344,13 @@ python -m pytest tests/ -q
 │   ├── store.py                # SQLite-backed pipeline state
 │   ├── subsets.py              # HF metadata pre-pass for the audit stage
 │   ├── viz.py                  # interactive HTTP graph viewer
-│   ├── recursive.py            # multi-hop expansion driver (§A)
+│   ├── recursive.py            # multi-hop expansion driver
 │   └── dedup/                  # post-merge dedup pipeline (4 sub-stages)
 │       ├── __main__.py         #   `python -m modsleuth.dedup`
 │       └── lib.py              #   shared helpers (signatures, union-find, …)
-├── baselines/                  # baseline runs (paper §3.3 / §C)
-│   ├── launch_baselines.py     #   fires all 16 (4 × 4) runs in parallel
-│   ├── prompts/                #   template + per-target baseline prompts
-│   │   ├── baseline_prompt.md
-│   │   └── baseline_prompt_<subject>.md
-│   ├── outputs/                #   committed per-system per-target JSON graphs
-│   │                           #   (4 baselines + prov / prov_unbounded ModSleuth, §B)
-│   └── README.md
-├── eval/                       # pooled LLM-as-judge verifier (paper §B)
-│   ├── pooled_eval.py          #   Sonnet 4.6 + web_search per cluster (Table 1)
-│   ├── full_graph_audit.py     #   per-edge audit across the full graph (Table 6, §D.2)
-│   ├── compute_graph_stats.py  #   reproduces Tables 2, 4, 5 (paper §4.1, §D.1)
-│   ├── build_modsleuth_inputs.py  # builds prov_<target>.json + prov_unbounded_<target>.json
-│   │                           #   from a merge_artifact.json (§B attribution rules)
-│   ├── verifier_prompt.md      #   verifier system prompt
-│   ├── outputs/                #   verifications.jsonl + score{,_per_target}.json
-│   └── README.md
-├── data/                       # release-only data artifact (git-lfs)
-│   └── merge_artifact.json     #   the 14,769-edge ModSleuth merged graph
-├── edge_audit.py               # static noise-pattern analyzer
-├── tests/
+├── baselines/                  # baseline task prompts (template + per-target)
+│   ├── baseline_prompt.md
+│   └── baseline_prompt_<subject>.md
 ├── pyproject.toml
 ├── requirements.txt
 ├── schema.sql
@@ -455,13 +362,12 @@ python -m pytest tests/ -q
 - **operation** — a structured group of edges that jointly describes one
   pipeline event (e.g., a DPO step). Edges within an operation share an
   anchor list and description, preserving the event structure that a flat
-  pairwise edge list would erase. The released merge artifact stores
-  operations in a flattened form: each row in `relations` carries one
-  `(subject, object, relation)` triple together with the full
-  `anchor_list` and `description` of its parent operation, so a single
-  operation that involved *N* objects appears as *N* rows that share
-  those fields. Table 5's "operations" count (14,701) excludes the few
-  rows with empty `anchor_list`.
+  pairwise edge list would erase. Merge artifacts carry a top-level
+  `operations` index (`operation_id` → event description, event
+  anchors, source batch) and every row in `relations` lists the
+  `operation_ids` it belongs to, so event structure survives
+  reconciliation and cross-run merging; each row additionally carries
+  its own edge-level `description` and `anchor_list`.
 - **anchor** — a source-side citation: file path, position, and verbatim
   excerpt grounding a claim to a specific spot in the source corpus.
 - **identity lattice** — partial-order structure for artifact identity with

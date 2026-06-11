@@ -25,13 +25,12 @@ or directly as a module:
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 
 # Canonical relations from pipeline (for relation-canonicality coloring)
@@ -125,19 +124,6 @@ def _make_off_lattice_node(node_id: str, surface: str) -> dict:
         "_synthesized": False,
         "in_degree": 0,
         "out_degree": 0,
-    }
-
-
-def _summarize_mend_artifact(art: dict) -> dict:
-    """Brief stats for the stats bar."""
-    if not art:
-        return {}
-    return {
-        "lattice_additions": len(art.get("lattice_additions") or []),
-        "edge_rewrites": len(art.get("edge_rewrites") or []),
-        "edge_drops": len(art.get("edge_drops") or []),
-        "auto_resolved_conflicts": len(art.get("auto_resolved_conflicts") or []),
-        "confirmed_off_lattice": len(art.get("confirmed_off_lattice") or []),
     }
 
 
@@ -1529,7 +1515,11 @@ def _load_graph_data_from_json(source_path: Path) -> dict:
             }
 
     edges: list[dict] = [
-        _build_edge_record(e, nodes, event_id=None, b_label="")
+        _build_edge_record(
+            e, nodes,
+            event_id=(e.get("operation_ids") or [None])[0],
+            b_label="",
+        )
         for e in (raw.get("relations") or [])
     ]
 
@@ -1580,10 +1570,20 @@ def _load_graph_data_from_json(source_path: Path) -> dict:
         "gated": gated,
         "nodes": list(nodes.values()),
         "edges": edges,
-        "operations": [],
+        # Merged artifacts carry an operations index; render it in the
+        # Operations tab. Older artifacts without one render empty.
+        "operations": [
+            {
+                "id": op_id,
+                "description": str(op.get("description") or ""),
+                "anchor_list": op.get("anchor_list") or [],
+                "batch": str(op.get("batch_id") or ""),
+            }
+            for op_id, op in (raw.get("operations") or {}).items()
+            if isinstance(op, dict)
+        ],
         "conflicts": conflicts,
         "human_review": [],
-        "mend_artifact_summary": {},
         "stats": {
             "source_stage": "external_json",
             "node_count": len(nodes),

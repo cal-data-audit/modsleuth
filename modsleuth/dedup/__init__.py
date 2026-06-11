@@ -12,11 +12,3 @@ evaluation:
 Run as ``python -m modsleuth.dedup --source merge.json --dest graph.json``
 or via ``modsleuth dedup --source merge.json --dest graph.json``.
 """
-
-from .lib import (  # noqa: F401
-    ConflictGuardedUnionFind,
-    StageLogger,
-    assert_invariants,
-    load_graph,
-    save_graph,
-)

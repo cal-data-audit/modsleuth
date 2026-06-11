@@ -22,6 +22,7 @@ The four stages are conceptually independent:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -176,7 +177,7 @@ SUBGRAPH:
 """
 
 
-def _build_hub_text(hub: str, role: str, edges: list[dict], idx_map: dict[int, int], anchor_lookup: dict[str, str]) -> str:
+def _build_hub_text(hub: str, role: str, edges: list[dict], idx_map: dict[int, int]) -> str:
     """Format a hub's outgoing/incoming edges for an Opus call."""
     lines = [f"HUB ({role}-side): {hub}", "", f"Edges ({len(idx_map)}):"]
     for local_id, edge_id in idx_map.items():
@@ -262,7 +263,7 @@ def llm_hub_audit(
         hub, role, idx_list, label = job
         # Local→global edge-id map (so the LLM sees small numbers).
         idx_map = {local: ei for local, ei in enumerate(idx_list)}
-        sg = _build_hub_text(hub, role, edges, idx_map, anchor_lookup=sample_anchors(graph))
+        sg = _build_hub_text(hub, role, edges, idx_map)
         prompt = HUB_PROMPT.format(direction=("outgoing" if role == "subject" else "incoming"), subgraph=sg)
         out, _ = call_opus(prompt, effort=effort)
         drops = _parse_hub_drops(out, idx_map)
@@ -276,6 +277,12 @@ def llm_hub_audit(
     tag_counts = Counter(t for t, _ in all_drops.values())
     for t, n in tag_counts.most_common():
         log.log(f"  {n:>4}  {t}")
+    # Full decision trail (log file only): every dropped edge with its reason.
+    for eid in sorted(all_drops):
+        tag, reason = all_drops[eid]
+        e = edges[eid]
+        log.append(f"DROP-EDGE :: {tag} :: {e.get('subject')} "
+                   f"--{e.get('relation')}--> {e.get('object')} :: {reason}")
 
     kept = [e for i, e in enumerate(edges) if i not in all_drops]
     final_node_set = {n for e in kept for n in (e["subject"], e["object"])}
@@ -541,6 +548,8 @@ def llm_node_dedup(
         prefixed = [m for m in members if "/" in m and not m.startswith("/")]
         pool = prefixed if prefixed else members
         canonical = max(pool, key=lambda m: (deg.get(m, 0), len(m)))
+        log.append(f"MERGE-NODES :: {canonical} <= "
+                   f"{sorted(m for m in members if m != canonical)}")
         for m in members:
             canon_map[m] = canonical
             if m != canonical:
@@ -587,6 +596,8 @@ NODES TO CLASSIFY ({n_items}):
 
 
 # Compatible relation pairs for transitive edge rewiring through dropped nodes.
+# Every relation this table can emit (trained_from / trained_on / filtered_by)
+# is a *direct* dependency; rewired edges carry that kind.
 COMPATIBLE_REWIRE = {
     ("trained_from", "trained_from"): "trained_from",
     ("trained_from", "merged_from"): "trained_from",
@@ -656,6 +667,10 @@ def release_filter(
     keep_set = {n for n, (v, _) in classifications.items() if v == "KEEP"}
     drop_set = set(nodes) - keep_set
     log.log(f"KEEP: {len(keep_set):,}  ·  DROP: {len(drop_set):,}")
+    # Full decision trail (log file only): every dropped node with its reason.
+    for n in sorted(drop_set):
+        _, reason = classifications.get(n, ("DROP", "(unclassified)"))
+        log.append(f"DROP-NODE :: {n} :: {reason}")
 
     # Rewire compatible chains through dropped nodes.
     edges_in: dict[str, list[tuple[str, int]]] = defaultdict(list)
@@ -690,7 +705,7 @@ def release_filter(
                     "subject": s,
                     "relation": new_rel,
                     "object": o,
-                    "dependency_kind": "indirect",
+                    "dependency_kind": "direct",
                     "description": f"(rewired through {x})",
                     "anchor_list": (anch_in + anch_out)[:6],
                     "description_variants": [],
@@ -735,28 +750,55 @@ STAGES: dict[str, callable] = {
 
 
 def run_dedup(source: str | Path, dest: str | Path,
-              stages: str = "all", log_path: str | Path | None = None) -> int:
-    """Run the dedup pipeline. Returns process exit code (0 on success, 2 on bad stage)."""
+              stages: str = "all", log_path: str | Path | None = None,
+              protect: tuple[str, ...] = (),
+              model: str | None = None) -> int:
+    """Run the dedup pipeline. Returns process exit code (0 on success, 2 on bad stage).
+
+    ``protect`` lists substrings (typically the run's seed identifiers)
+    that must still be present in the node set after every stage —
+    a guard against a stage collapsing or dropping a seed node.
+    ``model`` overrides the LLM used by the hub-audit / node-dedup /
+    release stages (default: Opus; also settable via
+    MODSLEUTH_DEDUP_MODEL).
+    """
+    if model:
+        os.environ["MODSLEUTH_DEDUP_MODEL"] = model
     stage_names = list(STAGES) if stages == "all" else [s.strip() for s in stages.split(",")]
     for s in stage_names:
         if s not in STAGES:
             print(f"Unknown stage: {s!r}; valid stages: {', '.join(STAGES)}", file=sys.stderr)
             return 2
 
-    log = StageLogger(Path(log_path) if log_path else None)
     src, dst = Path(source), Path(dest)
+    if src.resolve() == dst.resolve():
+        print("--dest must differ from --source (refusing in-place overwrite)",
+              file=sys.stderr)
+        return 2
+    if log_path is None:
+        log_path = f"{dst}.log"
+    log = StageLogger(Path(log_path))
     log.log(f"Source: {src}")
     log.log(f"Dest:   {dst}")
     log.log(f"Stages: {' → '.join(stage_names)}\n")
 
     t_start = time.time()
     graph = load_graph(src)
-    for s in stage_names:
+    for i, s in enumerate(stage_names):
         graph = STAGES[s](graph, log)
+        # Protected nodes must survive *every* stage, and each stage's
+        # output is checkpointed so a crash later never loses its work.
+        assert_invariants(collect_node_names(graph), tuple(protect))
+        if i < len(stage_names) - 1:
+            ckpt = dst.with_name(f"{dst.stem}.after-{s}{dst.suffix or '.json'}")
+            save_graph(graph, ckpt)
+            log.log(f"[checkpoint] {ckpt} — resume with "
+                    f"--source {ckpt} --stages <remaining>")
 
-    final_nodes = collect_node_names(graph)
-    assert_invariants(final_nodes)
-
+    if dst.exists():
+        bak = dst.with_name(dst.name + ".bak")
+        os.replace(dst, bak)
+        log.log(f"[backup] previous dest preserved at {bak}")
     save_graph(graph, dst)
     log.log(f"\n✓ Wrote {dst} ({dst.stat().st_size:,} bytes) in {(time.time() - t_start) / 60:.1f} min")
     return 0
@@ -771,9 +813,21 @@ def main() -> int:
         default="all",
         help=f"Comma-separated stages, or 'all'. Available: {', '.join(STAGES)}",
     )
-    p.add_argument("--log", default=None, help="Optional log file path; default = stderr only.")
+    p.add_argument("--log", default=None,
+                   help="Log file path (default: <dest>.log; appended, never truncated).")
+    p.add_argument(
+        "--protect", action="append", default=[],
+        help="Substring that must survive every stage (repeatable; "
+             "typically the run's seed identifiers).",
+    )
+    p.add_argument(
+        "--model", default=None,
+        help="LLM for the hub-audit / node-dedup / release stages "
+             "(default: Opus; also via MODSLEUTH_DEDUP_MODEL).",
+    )
     args = p.parse_args()
-    return run_dedup(args.source, args.dest, args.stages, args.log)
+    return run_dedup(args.source, args.dest, args.stages, args.log,
+                     protect=tuple(args.protect), model=args.model)
 
 
 if __name__ == "__main__":

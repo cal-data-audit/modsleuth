@@ -17,6 +17,7 @@ organize produced.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -58,8 +59,16 @@ _UNIQUE_ANCHOR_KINDS = frozenset({"hf_model", "hf_dataset", "vendor_docs"})
 
 def fetch_card(formal_name: str, *, timeout: float = 10.0) -> str | None:
     url = f"https://huggingface.co/datasets/{formal_name}/raw/main/README.md"
+    headers = {"User-Agent": "modsleuth/1.0"}
+    # Same auth the LLM stages use: unauthenticated HF traffic is
+    # rate-limited (~30/min), which silently starves `subsets[]` on
+    # lattices with hundreds of dataset nodes. Auth also resolves
+    # gated cards the token has access to.
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "graph/0.1"})
+        r = requests.get(url, timeout=timeout, headers=headers)
     except requests.RequestException:
         return None
     return r.text if r.status_code == 200 else None

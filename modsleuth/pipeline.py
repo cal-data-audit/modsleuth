@@ -162,6 +162,39 @@ def install_signal_handlers() -> None:
         pass
 
 
+def _tail_usage(stream_path: Path, offset: int, carry: bytes) -> tuple[int, bytes, int]:
+    """Incrementally accumulate output tokens from a growing stream:
+    read bytes appended since `offset`, parse complete JSONL lines, and
+    return (new_offset, carried_partial_line, output_token_delta).
+    Cheap enough to run every poll — it never re-reads old bytes."""
+    try:
+        with stream_path.open("rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return offset, carry, 0
+    if not data:
+        return offset, carry, 0
+    new_offset = offset + len(data)
+    buf = carry + data
+    lines = buf.split(b"\n")
+    carry = lines.pop()  # last element is a partial line (or b"")
+    delta = 0
+    for line in lines:
+        if b'"usage"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        value = ((rec.get("message") or {}).get("usage") or {}).get("output_tokens")
+        if isinstance(value, (int, float)):
+            delta += int(value)
+    return new_offset, carry, delta
+
+
 def parse_stream_json(stream_path: Path) -> dict:
     out: dict[str, Any] = {
         "turns": 0, "cost_usd": 0.0,
@@ -246,6 +279,9 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
             last_size = 0
             last_activity = time.monotonic()
             last_heartbeat = time.monotonic()
+            tail_offset = 0
+            tail_carry = b""
+            live_out_tokens = 0
             while True:
                 try:
                     rc = proc.wait(timeout=POLL_INTERVAL_S)
@@ -256,12 +292,16 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
                     cur_size = stream_path.stat().st_size
                 except OSError:
                     cur_size = last_size
+                tail_offset, tail_carry, delta = _tail_usage(
+                    stream_path, tail_offset, tail_carry)
+                live_out_tokens += delta
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_EVERY_S:
                     last_heartbeat = time.monotonic()
                     _progress(
                         f"{label or run_id}: running · "
                         f"{(time.monotonic() - started) / 60:.1f}m elapsed · "
-                        f"stream {cur_size / 1024:.0f}KB"
+                        f"stream {cur_size / 1024:.0f}KB · "
+                        f"{live_out_tokens / 1000:.1f}K tokens out"
                     )
                 if cur_size != last_size:
                     last_size = cur_size
@@ -312,6 +352,8 @@ def spawn_claude(run_id: str, prompt: str, *, model: str = config.CLAUDE_MODEL,
     return {
         "run_id": run_id, "exit_code": rc, "elapsed_s": elapsed,
         "log_dir": str(run_root), "killed_for_stall": killed_for_stall,
+        "output_tokens": attrs.get("output_tokens", 0),
+        "cost_usd": attrs.get("cost_usd", 0.0),
     }
 
 
@@ -365,7 +407,12 @@ def dispatch_spawn(
         last_result = result
         rc = result.get("exit_code", 0)
         if rc == 0:
-            _progress(f"{lab}: done in {result.get('elapsed_s', 0) / 60:.1f}m")
+            out_tok = result.get("output_tokens") or 0
+            cost = result.get("cost_usd") or 0.0
+            extra = f" · {out_tok / 1000:.1f}K tokens out" if out_tok else ""
+            extra += f" · ${cost:.2f}" if cost else ""
+            _progress(f"{lab}: done in "
+                      f"{result.get('elapsed_s', 0) / 60:.1f}m{extra}")
             return result
         if attempt >= max_retries:
             break

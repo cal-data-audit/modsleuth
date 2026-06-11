@@ -317,12 +317,13 @@ def triage_cmd(artifact_path: str | None, lattice_path: str | None,
 @click.option("--artifact", "artifact_path",
               help="Ingest an existing merge artifact for shape validation.")
 @click.option("--source", "sources", multiple=True,
-              help="Lattice artifact path. Pass multiple times for multiple "
-                   "runs. Default: this storage's latest organize/audit lattice.")
+              help="Lattice artifact path OR a prior merge_artifact.json "
+                   "(cross-seed merge). Pass multiple times. Default: this "
+                   "storage's latest organize/audit lattice.")
 @click.option("--relations", "relations_sources", multiple=True,
-              help="Relations artifact path. Pass multiple times. Default "
-                   "(when --source is also omitted): every completed "
-                   "per-batch relate artifact in this storage.")
+              help="Relations artifact path. Pass multiple times. Default: "
+                   "relations carried by --source merge artifacts, or (bare "
+                   "merge) every completed relate artifact in this storage.")
 def merge_cmd(artifact_path: str | None, sources: tuple[str, ...],
               relations_sources: tuple[str, ...]):
     """Pure-Python cross-run merge of lattices and relations."""
@@ -373,12 +374,19 @@ def expand_cmd(node: str, planner_model: str, subagent_model: str,
                    "across depths by cumulative score).")
 @click.option("--storage-root", "storage_root", default=None,
               help="Root directory for per-seed MODSLEUTH_STORAGE dirs. "
-                   "Defaults to <repo>/storage.")
+                   "Defaults to ./storage under the current directory.")
 @click.option("--triage-gate/--no-triage-gate", default=True, show_default=True,
               help="Expand only nodes the triage queue marks auto_expand "
                    "(decline/manual nodes never consume expansion budget).")
+@click.option("--planner-model", default=None,
+              help="Claude model for every stage planner — an alias "
+                   "('opus', 'sonnet', 'haiku') or a full model ID. "
+                   "Default: each stage's own default.")
+@click.option("--subagent-model", default=None,
+              help="Claude model the planners pass on every Task call.")
 def recursive_cmd(seeds: tuple[str, ...], depth: int, top_k: int,
-                  strategy: str, storage_root: str | None, triage_gate: bool):
+                  strategy: str, storage_root: str | None, triage_gate: bool,
+                  planner_model: str | None, subagent_model: str | None):
     """Reference recursive-expansion driver.
 
     Multi-hop driver. For each seed, runs the base pipeline, then
@@ -400,6 +408,10 @@ def recursive_cmd(seeds: tuple[str, ...], depth: int, top_k: int,
         argv += ["--no-triage-gate"]
     if storage_root:
         argv += ["--storage-root", storage_root]
+    if planner_model:
+        argv += ["--planner-model", planner_model]
+    if subagent_model:
+        argv += ["--subagent-model", subagent_model]
     raise SystemExit(recursive_main(argv))
 
 

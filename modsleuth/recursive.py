@@ -64,9 +64,6 @@ import time
 from collections import Counter
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
 def _slug(target: str) -> str:
     """Turn a HF-style ``org/Model-Name`` into a filesystem-safe slug."""
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", target).strip("_")[:80] or "seed"
@@ -74,9 +71,12 @@ def _slug(target: str) -> str:
 
 def _run(env: dict[str, str], *args: str) -> None:
     """Run a ``modsleuth`` CLI invocation with the given env, fail loudly on error."""
-    full = ["python3", "-m", "modsleuth.cli", *args]
+    # sys.executable, not bare `python3`: the child must run in the same
+    # interpreter/venv that has modsleuth installed. cwd is inherited —
+    # storage is pinned via MODSLEUTH_STORAGE in env.
+    full = [sys.executable, "-m", "modsleuth.cli", *args]
     print(f"[run] {' '.join(full)}", flush=True)
-    proc = subprocess.run(full, env=env, cwd=REPO_ROOT)
+    proc = subprocess.run(full, env=env)
     if proc.returncode != 0:
         raise SystemExit(f"command failed (rc={proc.returncode}): {' '.join(full)}")
 
@@ -226,13 +226,16 @@ def _pick_beam(graph: dict, expanded: set[str], top_k: int,
 
 def expand_seed(seed: str, depth: int, top_k: int,
                 storage_root: Path, strategy: str = "bfs",
-                triage_gate: bool = True) -> Path:
+                triage_gate: bool = True,
+                planner_model: str | None = None,
+                subagent_model: str | None = None) -> Path:
     """Run the base pipeline for ``seed``, then expand top-K parents up
     to ``depth`` hops using ``strategy`` ∈ {bfs, dfs, beam}. Returns the
     path to the final merged graph.
 
     With ``triage_gate`` (default), each round refreshes the triage
-    queue and expands only ``auto_expand`` nodes.
+    queue and expands only ``auto_expand`` nodes. ``planner_model`` /
+    ``subagent_model`` are forwarded to every LLM stage invocation.
     """
     seed_storage = (storage_root / _slug(seed)).resolve()
     seed_storage.mkdir(parents=True, exist_ok=True)
@@ -241,14 +244,25 @@ def expand_seed(seed: str, depth: int, top_k: int,
     env["MODSLEUTH_STORAGE"] = str(seed_storage)
     env["MODSLEUTH_PATH"] = str(seed_storage / "graph.db")
 
+    # Forwarded to the stages that spawn planners; reconcile / merge /
+    # init are pure Python and take no model flags.
+    model_flags: list[str] = []
+    if planner_model:
+        model_flags += ["--planner-model", planner_model]
+    if subagent_model:
+        model_flags += ["--subagent-model", subagent_model]
+    llm_stages = {"discover", "extract", "organize", "audit",
+                  "relate", "triage", "expand"}
+
     print(f"\n=== seed={seed}  storage={seed_storage}  strategy={strategy} ===", flush=True)
 
     # Depth-1: full base pipeline against the seed.
     _run(env, "init")
-    _run(env, "run", "discover", "--target", seed)
+    _run(env, "run", "discover", "--target", seed, *model_flags)
     for stage in ("extract", "organize", "audit", "relate",
                   "reconcile", "triage", "merge"):
-        _run(env, "run", stage)
+        _run(env, "run", stage,
+             *(model_flags if stage in llm_stages else []))
 
     expanded: set[str] = {seed}
     beam_history: dict[str, int] = {}  # only used by beam
@@ -268,7 +282,7 @@ def expand_seed(seed: str, depth: int, top_k: int,
             if d > 2:
                 # Depth-1 ran triage as part of the base pipeline;
                 # later rounds re-classify against the grown graph.
-                _run(env, "run", "triage")
+                _run(env, "run", "triage", *model_flags)
             gate = _load_triage_gate(seed_storage, canon)
             allowed = gate["auto_expand"] - expanded
             print(f"[depth {d}] triage gate: "
@@ -295,7 +309,7 @@ def expand_seed(seed: str, depth: int, top_k: int,
         print(f"[depth {d}] {strategy}: expanding {len(candidates)} parent(s): {candidates}", flush=True)
         t_round = time.monotonic()
         for node in candidates:
-            _run(env, "run", "expand", "--node", node)
+            _run(env, "run", "expand", "--node", node, *model_flags)
             expanded.add(node)
         # Re-merge so the per-seed graph reflects newly added relate artifacts.
         _run(env, "run", "merge")
@@ -330,8 +344,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Rank expansion candidates without the triage queue "
                         "(by default only auto_expand nodes are expanded).")
     p.add_argument("--storage-root", type=Path,
-                   default=REPO_ROOT / "storage",
-                   help="Root directory for per-seed MODSLEUTH_STORAGE dirs.")
+                   default=Path.cwd() / "storage",
+                   help="Root directory for per-seed MODSLEUTH_STORAGE dirs "
+                        "(default: ./storage under the current directory).")
+    p.add_argument("--planner-model", default=None,
+                   help="Claude model for every stage planner (alias or full "
+                        "model ID). Default: each stage's own default.")
+    p.add_argument("--subagent-model", default=None,
+                   help="Claude model the planners pass on every Task call.")
     args = p.parse_args(argv)
 
     args.storage_root.mkdir(parents=True, exist_ok=True)
@@ -339,7 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     for seed in args.seed:
         finals.append(expand_seed(seed, args.depth, args.top_k,
                                   args.storage_root, args.strategy,
-                                  triage_gate=args.triage_gate))
+                                  triage_gate=args.triage_gate,
+                                  planner_model=args.planner_model,
+                                  subagent_model=args.subagent_model))
 
     print("\n=== finished ===")
     for path in finals:

@@ -148,8 +148,13 @@ modsleuth recursive \
     --seed nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
     --seed rl-research_DR-Tulu-8B \
     --seed HuggingFaceTB/SmolLM3-3B \
-    --depth 3 --top-k 5 --strategy bfs    # or --strategy dfs / beam
+    --depth 3 --top-k 5 --strategy bfs \  # or --strategy dfs / beam
+    --planner-model opus --subagent-model sonnet
 ```
+
+`--planner-model` / `--subagent-model` are forwarded to every LLM
+stage of every seed and expansion round; per-seed storages land under
+`--storage-root` (default `./storage`).
 
 For each seed it runs the full base pipeline once (in its own per-seed
 `MODSLEUTH_STORAGE` directory), then iteratively expands

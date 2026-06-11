@@ -2296,7 +2296,12 @@ def _merge_lattices(artifacts: list[dict]) -> tuple[dict, list[dict]]:
 
     items_by_key: dict[tuple[str, str | None], dict] = {}
     for art in artifacts:
-        for grp in art.get("groups") or []:
+        groups = art.get("groups")
+        if groups is None:
+            # Prior merge artifacts nest the lattice one level down —
+            # accepted so cross-seed merges can consume merge outputs.
+            groups = (art.get("lattice") or {}).get("groups")
+        for grp in groups or []:
             family = grp.get("family") or ""
             family_entry = by_family.setdefault(family, {
                 "family": family,
@@ -2372,30 +2377,45 @@ def _merge_relations(
     each merged edge carries every source from every contributing
     artifact. Differing per-edge descriptions surface in conflicts.
 
-    Each artifact is shaped as `{operations: [{description, anchor_list,
-    edges: [...]}]}`; edges are flattened across all operations, but
-    every merged edge keeps its `operation_ids` and the returned
-    operations index `{operation_id: {description, anchor_list,
-    batch_id}}` preserves the event structure.
+    Each artifact is either relate-shaped — `{operations:
+    [{description, anchor_list, edges: [...]}]}` — or a prior merge
+    artifact: flat `relations[]` plus an `operations` index dict
+    (accepted so cross-seed merges can consume per-seed merge
+    outputs). Edges are flattened and unified by triple; every merged
+    edge keeps its `operation_ids` and the returned operations index
+    `{operation_id: {description, anchor_list, batch_id}}` preserves
+    the event structure.
     """
     by_key: dict[tuple[str, str, str], dict] = {}
     operations: dict[str, dict] = {}
     conflicts: list[dict] = []
     for art in artifacts:
         bid = art.get("batch_id")
-        for i, op in enumerate(art.get("operations") or []):
-            if not isinstance(op, dict):
-                continue
-            op_id = str(op.get("operation_id")
-                        or f"op:{str(bid or 'nobatch')[:8]}:{i}")
-            operations.setdefault(op_id, {
-                "description": op.get("description"),
-                "anchor_list": list(op.get("anchor_list") or []),
-                "batch_id": bid,
-            })
-            for edge in op.get("edges") or []:
-                if not isinstance(edge, dict):
+        ops = art.get("operations")
+        edge_iter: list[tuple[str | None, dict]] = []
+        if isinstance(ops, dict):
+            # Prior merge artifact: union its operations index; its
+            # reconciled edges already carry operation_ids.
+            for op_id, op in ops.items():
+                if isinstance(op, dict):
+                    operations.setdefault(str(op_id), op)
+            edge_iter = [(None, e) for e in art.get("relations") or []
+                         if isinstance(e, dict)]
+        else:
+            for i, op in enumerate(ops or []):
+                if not isinstance(op, dict):
                     continue
+                op_id = str(op.get("operation_id")
+                            or f"op:{str(bid or 'nobatch')[:8]}:{i}")
+                operations.setdefault(op_id, {
+                    "description": op.get("description"),
+                    "anchor_list": list(op.get("anchor_list") or []),
+                    "batch_id": bid,
+                })
+                for edge in op.get("edges") or []:
+                    if isinstance(edge, dict):
+                        edge_iter.append((op_id, edge))
+        for op_id, edge in edge_iter:
                 def _str(v):
                     if isinstance(v, dict):
                         return v.get("formal_name") or v.get("name") or ""
@@ -2412,7 +2432,7 @@ def _merge_relations(
                                     if edge.get("traced_target") else []))
                 ]
                 edge_op_ids = list(edge.get("operation_ids") or [])
-                if op_id not in edge_op_ids:
+                if op_id and op_id not in edge_op_ids:
                     edge_op_ids.append(op_id)
                 if key in by_key:
                     target = by_key[key]
@@ -2531,6 +2551,12 @@ def run_merge(
     relation_conflicts: list[dict] = []
     if relations_sources:
         rel_artifacts = [read_json(s) for s in relations_sources]
+    else:
+        # Cross-seed merge: sources that are prior merge artifacts
+        # carry their relations too — merge those by default.
+        rel_artifacts = [a for a in lattice_artifacts
+                         if isinstance(a.get("relations"), list)]
+    if rel_artifacts:
         merged_relations, merged_operations, relation_conflicts = (
             _merge_relations(rel_artifacts)
         )

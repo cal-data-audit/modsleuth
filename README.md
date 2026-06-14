@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://modsleuth.cal-data-audit.org"><img src="https://img.shields.io/badge/demo-cal--data--audit-blue" alt="demo"></a>
   <a href="https://arxiv.org/abs/2606.12385"><img src="https://img.shields.io/badge/paper-2606.12385-red" alt="paper"></a>
+  <a href="https://github.com/cal-data-audit/modsleuth-demo"><img src="https://img.shields.io/badge/data-modsleuth--demo-green" alt="data"></a>
 </p>
 
 ModSleuth starts from a target model release, reads its public artifacts
